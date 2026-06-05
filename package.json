@@ -1,0 +1,31 @@
+{
+  "name": "mexc_opener",
+  "version": "1.0.0",
+  "description": "Automated cross-account silver (SILVER_USDT) futures hedge opener for MEXC with WS-driven SL/TP management.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node scripts/check.js",
+    "open-now": "node scripts/open-now.js"
+  },
+  "keywords": [
+    "mexc",
+    "futures",
+    "hedge",
+    "silver",
+    "trading-bot"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "https-proxy-agent": "^7.0.5",
+    "luxon": "^3.5.0",
+    "socks-proxy-agent": "^8.0.4",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

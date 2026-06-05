@@ -1,0 +1,33 @@
+{
+  "accounts": {
+    "acc1": {
+      "webToken": "WEB_PASTE_u_id_COOKIE_FROM_BROWSER",
+      "proxy": "http://user:pass@host:port"
+    },
+    "acc2": {
+      "webToken": "WEB_PASTE_u_id_COOKIE_FROM_BROWSER",
+      "proxy": "host:port:user:pass"
+    }
+  },
+  "groups": [
+    {
+      "name": "silver_pair_1",
+      "enabled": true,
+      "symbol": "SILVER_USDT",
+      "longAccount": "acc1",
+      "shortAccount": "acc2",
+      "marginUsdt": 50,
+      "leverage": 20,
+      "openType": 1,
+      "orderType": "limit",
+      "limitLevel": 3,
+      "pctBasis": "roe",
+      "strategy": {
+        "profitTriggerPct": 0.4,
+        "stopLockPct": 0.2,
+        "tp2TriggerPct": 0.4,
+        "tp2Pct": 0.4
+      }
+    }
+  ]
+}
