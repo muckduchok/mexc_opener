@@ -6,8 +6,8 @@ const logger = require('./logger');
 const PHASE = {
   WATCHING: 'watching', // both legs open, waiting for first leg to hit profit trigger
   ARMED_FIRST: 'armed_first', // SL placed on winner, waiting for it to fill
-  SECOND_LEG: 'second_leg', // winner SL filled, TP armed on loser immediately
-  ARMED_SECOND: 'armed_second', // TP placed on loser, waiting for it to fill
+  SECOND_LEG: 'second_leg', // winner closed, waiting for loser to reach tp2 trigger
+  ARMED_SECOND: 'armed_second', // profit-lock SL placed on loser, waiting for it to fill
   DONE: 'done',
 };
 
@@ -99,8 +99,11 @@ class HedgeMonitor {
         await this._armFirst(best, price);
       }
     } else if (run.phase === PHASE.SECOND_LEG) {
-      // fallback for resume / placement retry; normally armed the instant SL fills
-      if (!run.tpPlaced) await this._armSecond(price);
+      const loser = run.loser;
+      const pnl = this.legPnl(loser, price);
+      if (pnl >= run.strategy.tp2TriggerPct) {
+        await this._armSecond(price);
+      }
     }
   }
 
@@ -113,8 +116,10 @@ class HedgeMonitor {
       const spec = await this.contracts.get(run.symbol);
       // stopLockPct is in the configured basis; convert to a raw price-move %
       const slRaw = priceForPnlPct(winner, leg.entry, run.strategy.stopLockPct / this._factor());
-      // round towards locking slightly less profit (conservative trigger placement)
-      const mode = winner === 'long' ? 'floor' : 'ceil';
+      // Round AWAY from entry (towards profit) so the locked PnL is always >=
+      // stopLockPct. Rounding towards entry would collapse to the entry price
+      // (0% lock) whenever the target offset is smaller than one price tick.
+      const mode = winner === 'long' ? 'ceil' : 'floor';
       const slPrice = this.contracts.roundPrice(spec, slRaw, mode);
       const rest = this.getRest(leg.account);
       logger.info(
@@ -148,28 +153,33 @@ class HedgeMonitor {
       const loser = run.loser;
       const leg = run[loser];
       const spec = await this.contracts.get(run.symbol);
-      // tp2Pct is in the configured basis; convert to a raw price-move %
-      const tpRaw = priceForPnlPct(loser, leg.entry, run.strategy.tp2Pct / this._factor());
+      // tp2Pct is in the configured basis; convert to a raw price-move %.
+      // Place a profit-locking STOP (not a take-profit) so the leg keeps running
+      // and we control the exit on a reversal.
+      const slRaw = priceForPnlPct(loser, leg.entry, run.strategy.tp2Pct / this._factor());
+      // Round AWAY from entry (towards profit) so the locked PnL is always >=
+      // tp2Pct — never collapses to the entry price when the target offset is
+      // smaller than one price tick.
       const mode = loser === 'long' ? 'ceil' : 'floor';
-      const tpPrice = this.contracts.roundPrice(spec, tpRaw, mode);
+      const slPrice = this.contracts.roundPrice(spec, slRaw, mode);
       const rest = this.getRest(leg.account);
       logger.info(
-        `[monitor ${run.id}] winner SL filled -> placing TP on ${loser.toUpperCase()} immediately ` +
-          `@+${run.strategy.tp2Pct}% ${run.pctBasis} -> price ${tpPrice} on ${leg.account} pos ${leg.positionId}`
+        `[monitor ${run.id}] ${loser.toUpperCase()} reached +${run.strategy.tp2TriggerPct}% ${run.pctBasis} (pnl@${price}). ` +
+          `Placing SL lock @+${run.strategy.tp2Pct}% ${run.pctBasis} -> price ${slPrice} on ${leg.account} pos ${leg.positionId}`
       );
       await rest.placeTpSlByPosition({
         symbol: run.symbol,
         positionId: leg.positionId,
         vol: leg.vol,
-        takeProfitPrice: tpPrice,
+        stopLossPrice: slPrice,
       });
-      run.tpPrice = tpPrice;
-      run.tpPlaced = true;
+      run.tp2SlPrice = slPrice;
+      run.tp2SlPlaced = true;
       run.phase = PHASE.ARMED_SECOND;
       this.state.upsertRun(run);
-      logger.info(`[monitor ${run.id}] TP placed. phase -> armed_second (waiting for ${loser} to fill)`);
+      logger.info(`[monitor ${run.id}] 2nd-leg SL placed. phase -> armed_second (waiting for ${loser} to fill)`);
     } catch (e) {
-      logger.error(`[monitor ${run.id}] failed to place TP on loser: ${e.message}`);
+      logger.error(`[monitor ${run.id}] failed to place 2nd-leg SL on loser: ${e.message}`);
     } finally {
       this.busy = false;
     }
@@ -211,20 +221,20 @@ class HedgeMonitor {
         logger.info(`[monitor ${run.id}] winner (${run.winner}) stop filled -> phase second_leg`);
         run.phase = PHASE.SECOND_LEG;
         this.state.upsertRun(run);
-        // place TP on the loser right away (no tp2 trigger wait)
+        // re-evaluate loser immediately against the latest price
         const price = this.feed.getPrice(run.symbol);
-        await this._armSecond(price);
+        if (price) await this._onPrice({ symbol: run.symbol, price });
       }
     } else if (run.phase === PHASE.SECOND_LEG) {
       const open = await this._isLegOpen(run.loser);
       if (!open) {
-        logger.warn(`[monitor ${run.id}] loser (${run.loser}) closed before TP was armed -> done`);
+        logger.warn(`[monitor ${run.id}] loser (${run.loser}) closed before 2nd-leg stop was armed -> done`);
         this._finish();
       }
     } else if (run.phase === PHASE.ARMED_SECOND) {
       const open = await this._isLegOpen(run.loser);
       if (!open) {
-        logger.info(`[monitor ${run.id}] loser (${run.loser}) take-profit filled`);
+        logger.info(`[monitor ${run.id}] loser (${run.loser}) 2nd-leg stop filled`);
         this._finish();
       }
     }

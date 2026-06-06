@@ -4,7 +4,7 @@
  * Read-only validation:
  *  - loads config
  *  - fetches public contract detail for each group's symbol
- *  - calls open_positions per account (verifies web token + proxy + signing)
+ *  - calls open_positions per account (verifies web token + signing)
  *  - opens the public price WS briefly to confirm a live price
  *  - prints the next scheduled market open
  *
@@ -14,7 +14,6 @@ const config = require('../src/config');
 const { MexcRest } = require('../src/mexc/rest');
 const { PriceFeed } = require('../src/mexc/ws');
 const { ContractCache } = require('../src/contracts');
-const { describeProxy } = require('../src/proxy');
 const { describeNext } = require('../src/scheduler');
 const { sleep } = require('../src/util');
 
@@ -23,7 +22,11 @@ async function main() {
   console.log('── config ───────────────────────────────────────────────');
   console.log(`config file: ${cfg.configPath}`);
   console.log(`accounts: ${Object.keys(cfg.accounts).join(', ')}`);
-  console.log(`groups: ${cfg.groups.map((g) => g.name).join(', ')}`);
+  console.log(
+    `groups: ${cfg.groups
+      .map((g) => `${g.name}[${g.mode}:${g.mode === 'single' ? g.longAccount : `${g.longAccount}+${g.shortAccount}`}]`)
+      .join(', ')}`
+  );
   const next = describeNext(cfg.schedule);
   console.log(`next market open: ${next.human} (in ${(next.inMs / 60000).toFixed(1)} min)`);
 
@@ -74,9 +77,9 @@ async function main() {
     }
   }
 
-  console.log('\n── accounts (web token + proxy + signing) ───────────────');
+  console.log('\n── accounts (web token + signing) ──────────────────────');
   for (const [name, client] of rest) {
-    process.stdout.write(`  ${name} (${describeProxy(cfg.accounts[name].proxy)}): `);
+    process.stdout.write(`  ${name}: `);
     try {
       const positions = await client.getOpenPositions();
       const open = positions.filter((p) => Number(p.holdVol) > 0);
@@ -91,17 +94,17 @@ async function main() {
   }
 
   console.log('\n── price WebSocket ──────────────────────────────────────');
-  const feed = new PriceFeed({ wsUrl: cfg.endpoints.wsUrl, proxy: cfg.endpoints.wsProxy, priceSource: cfg.priceSource });
+  const feed = new PriceFeed({ wsUrl: cfg.endpoints.wsUrl, priceSource: cfg.priceSource });
   feed.start();
   for (const s of symbols) feed.subscribe(s);
   await sleep(5000);
   for (const s of symbols) {
     const l = feed.getLatest(s);
-    console.log(l ? `  OK  ${s}: last=${l.last} fair=${l.fair} bid=${l.bid} ask=${l.ask}` : `  ERR ${s}: no price received (WS blocked? try WS_PROXY)`);
+    console.log(l ? `  OK  ${s}: last=${l.last} fair=${l.fair} bid=${l.bid} ask=${l.ask}` : `  ERR ${s}: no price received (WS blocked?)`);
   }
   feed.stop();
 
-  console.log('\nDone. If accounts show FAIL, refresh the WEB token (u_id cookie) and check the proxy.');
+  console.log('\nDone. If accounts show FAIL, refresh the WEB token (u_id cookie).');
   process.exit(0);
 }
 

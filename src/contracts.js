@@ -50,7 +50,33 @@ class ContractCache {
   }
 
   /**
-   * Convert a USDT margin + leverage into an integer number of contracts.
+   * Size an integer number of contracts for a TARGET NOTIONAL (the final
+   * position value in USDT), independent of leverage.
+   *   contracts = notional / (price * contractSize)
+   * Leverage only affects how much collateral the exchange locks
+   * (collateral = notional / leverage). Floored to volUnit, clamped to
+   * [minVol, maxVol]. Returns { vol, notional, marginUsed } or throws < minVol.
+   */
+  contractsFromNotional(spec, { notionalUsdt, leverage, price }) {
+    if (!(price > 0)) throw new Error('price required to size order');
+    if (!(notionalUsdt > 0)) throw new Error('notionalUsdt required to size order');
+    const perContract = price * spec.contractSize;
+    let vol = Math.floor(notionalUsdt / perContract / spec.volUnit) * spec.volUnit;
+    if (vol < spec.minVol) {
+      throw new Error(
+        `computed vol ${vol} < minVol ${spec.minVol} for ${spec.symbol} (increase margin/notional). ` +
+          `notional=${notionalUsdt.toFixed(2)} perContract=${perContract.toFixed(6)}`
+      );
+    }
+    if (vol > spec.maxVol) vol = Math.floor(spec.maxVol / spec.volUnit) * spec.volUnit;
+    const notional = vol * perContract;
+    const marginUsed = leverage > 0 ? notional / leverage : null;
+    return { vol, notional, marginUsed };
+  }
+
+  /**
+   * Convert a USDT margin (collateral) + leverage into an integer number of
+   * contracts.
    *   notional   = margin * leverage   (USDT)
    *   contracts  = notional / (price * contractSize)
    * Floored to volUnit and clamped to [minVol, maxVol].

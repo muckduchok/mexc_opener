@@ -1,8 +1,15 @@
 'use strict';
 
+const http = require('http');
+const https = require('https');
 const axios = require('axios');
 const { signWeb, buildHeaders } = require('./sign');
-const { buildProxyAgent } = require('../proxy');
+
+// Shared keep-alive agents so repeated calls (sizing, order submit, stop-loss
+// placement, position polling) reuse warm TCP/TLS connections instead of paying
+// a fresh handshake each time — this measurably cuts order-placement latency.
+const keepAliveHttp = new http.Agent({ keepAlive: true, maxSockets: 64 });
+const keepAliveHttps = new https.Agent({ keepAlive: true, maxSockets: 64 });
 
 // MEXC order sides
 const SIDE = {
@@ -30,7 +37,7 @@ class MexcRestError extends Error {
 
 class MexcRest {
   /**
-   * @param {object} account  { name, webToken, proxy }
+   * @param {object} account  { name, webToken }
    * @param {object} opts      { privateBase, contractBase, timeoutMs }
    */
   constructor(account, opts = {}) {
@@ -39,11 +46,10 @@ class MexcRest {
     this.contractBase = opts.contractBase || 'https://contract.mexc.com/api/v1';
     this.timeoutMs = opts.timeoutMs || 15000;
 
-    const agent = buildProxyAgent(account.proxy);
     this.http = axios.create({
       timeout: this.timeoutMs,
-      httpAgent: agent || undefined,
-      httpsAgent: agent || undefined,
+      httpAgent: keepAliveHttp,
+      httpsAgent: keepAliveHttps,
       proxy: false,
       // never throw on non-2xx; we decode the JSON body ourselves
       validateStatus: () => true,

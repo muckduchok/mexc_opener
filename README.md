@@ -1,8 +1,14 @@
 # mexc_opener
 
-Автооткрытие **хедж‑позиций по серебру** (`SILVER_USDT`) на фьючерсах MEXC с разных
-аккаунтов (long на одном, short на другом), через прокси, по расписанию открытия рынка,
-с управлением стоп‑лоссом / тейк‑профитом по WebSocket.
+Автооткрытие **хедж‑позиций по серебру** (`SILVER_USDT`) на фьючерсах MEXC, через прокси,
+по расписанию открытия рынка, с управлением стоп‑лоссом / тейк‑профитом по WebSocket.
+
+Поддерживаются два режима хеджа (настройка `mode` в группе):
+
+- **`dual`** (по умолчанию) — long на одном аккаунте, short на другом (как раньше).
+- **`single`** — обе ноги (long + short) на **одном** аккаунте; всё отслеживается и
+  управляется на нём. Аккаунт **должен быть в режиме Hedge** на MEXC (`positionMode=1`
+  ставится автоматически). Удобно, когда на каждый сервер/аккаунт — свой конфиг.
 
 ## Как это работает
 
@@ -16,8 +22,10 @@
    На 10x: `0.4% roe` = всего `0.04%` движения цены — пороги под `roe` задавай с учётом плеча.
 3. **Стоп‑лосс первой ноги**: как только любая нога доходит до `+profitTriggerPct` (напр. 0.4%),
    на неё ставится биржевой стоп‑лосс, фиксирующий `+stopLockPct` (напр. 0.2%).
-4. **Тейк‑профит второй ноги**: как только первую ногу выбило по стопу, бот **сразу** ставит
-   на оставшуюся ногу биржевой тейк‑профит на `+tp2Pct` (без ожидания триггера).
+4. **Стоп‑лосс второй ноги**: когда первую ногу выбило по стопу, бот ждёт, пока оставшаяся
+   (противоположная) нога перешагнёт `+tp2TriggerPct`, и ставит на неё **биржевой
+   стоп‑лосс**, фиксирующий `+tp2Pct` (а не тейк‑профит) — так прибыль может расти дальше,
+   а закрытие контролируется стопом при развороте. Поэтому `tp2Pct` должен быть **< `tp2TriggerPct`**.
 
 > Все SL/TP — это **реальные биржевые триггер‑ордеры** (`/private/stoporder/place`),
 > поэтому они срабатывают даже если бот/сеть упадут.
@@ -40,7 +48,7 @@ MEXC **отключил размещение фьючерсных ордеров
 npm install
 cp .env.example .env
 cp config.example.json config.json
-# заполните config.json (аккаунты + прокси + группы) и при желании .env
+# заполните config.json (аккаунты + группы) и при желании .env
 ```
 
 ## Конфигурация
@@ -50,27 +58,45 @@ cp config.example.json config.json
 ```json
 {
   "accounts": {
-    "acc1": { "webToken": "WEB...", "proxy": "http://user:pass@host:port" },
-    "acc2": { "webToken": "WEB...", "proxy": "socks5://user:pass@host:port" }
+    "acc1": { "webToken": "WEB..." },
+    "acc2": { "webToken": "WEB..." }
   },
   "groups": [
     {
-      "name": "silver_pair_1",
+      "name": "silver_dual",
       "enabled": true,
+      "mode": "dual",
       "symbol": "SILVER_USDT",
       "longAccount": "acc1",
       "shortAccount": "acc2",
       "marginUsdt": 50,
       "leverage": 20,
       "openType": 1,
-      "strategy": { "profitTriggerPct": 0.4, "stopLockPct": 0.2, "tp2TriggerPct": 0.4, "tp2Pct": 0.4 }
+      "positionMode": 1,
+      "strategy": { "profitTriggerPct": 0.4, "stopLockPct": 0.2, "tp2TriggerPct": 0.4, "tp2Pct": 0.2 }
+    },
+    {
+      "name": "silver_single",
+      "enabled": false,
+      "mode": "single",
+      "symbol": "SILVER_USDT",
+      "account": "acc1",
+      "marginUsdt": 50,
+      "leverage": 20,
+      "openType": 1,
+      "positionMode": 1,
+      "strategy": { "profitTriggerPct": 0.4, "stopLockPct": 0.2, "tp2TriggerPct": 0.4, "tp2Pct": 0.2 }
     }
   ]
 }
 ```
 
-- **Мульти‑открытие**: добавьте несколько групп (acc1_long+acc2_short, acc3_long+acc4_short и т.д.) —
-  все открываются одновременно и мониторятся независимо.
+- **mode**: `"dual"` (по умолчанию) — long и short на **разных** аккаунтах (`longAccount` +
+  `shortAccount`). `"single"` — обе ноги на **одном** аккаунте (`account`); аккаунт обязан быть
+  в режиме **Hedge** на MEXC (тогда он держит обе стороны), `positionMode` принудительно = `1`.
+  Глобальный дефолт — `DEFAULT_HEDGE_MODE` в `.env`.
+- **Мульти‑открытие**: добавьте несколько групп — все открываются одновременно и мониторятся
+  независимо. Мультиаккаунтность не требуется: можно запускать по одному конфигу на сервер.
 - **Размер**: `marginUsdt` — залог (USDT) на каждую ногу; нотионал = `marginUsdt × leverage`,
   переводится в число контрактов по спецификации контракта. Можно задать `volContracts` напрямую.
 - **openType**: `1` = изолированная маржа, `2` = кросс.
@@ -85,29 +111,121 @@ cp config.example.json config.json
   детерминирована. Если лимитка не зальётся за отведённое время, бот отменяет «висяки» и
   закрывает успевшую открыться ногу (без голой позиции).
 - **pctBasis**: `"roe"` (по умолчанию, как PnL% в MEXC) или `"price"` (движение цены без плеча).
-- `proxy` поддерживает `http/https/socks5` (свой на каждый аккаунт). Принимаются оба формата:
-  стандартный URL `http://user:pass@host:port` и провайдерский `host:port:user:pass`
-  (как у proxyshard и т.п.) — второй автоматически конвертируется.
+
+> Подключение по прокси **убрано** — все запросы (REST и ценовой WebSocket) идут напрямую
+> с сервера. HTTP‑соединения используют keep‑alive, чтобы размещение ордеров/стопов было быстрее.
 
 Глобальные настройки — в `.env` (см. `.env.example`):
 
 - `MARKET_OPEN_TZ` / `MARKET_OPEN_WEEKDAY` / `MARKET_OPEN_HOUR` / `MARKET_OPEN_MINUTE` —
   расписание открытия. **Время считается строго в этой таймзоне**, независимо от UTC сервера.
-  «Полночь вс→пн» = weekday `1` (понедельник), hour `0`.
+  По умолчанию `Europe/Warsaw` (польское время), «Полночь вс→пн» = weekday `1` (понедельник), hour `0`.
 - `PROFIT_TRIGGER_PCT`, `STOP_LOCK_PCT`, `TP2_TRIGGER_PCT`, `TP2_PCT` — пороги по умолчанию
-  (переопределяются в группе через `strategy`).
+  (переопределяются в группе через `strategy`). Вторая нога теперь закрывается **стоп‑лоссом**
+  (фиксация `+TP2_PCT` при достижении `+TP2_TRIGGER_PCT`), поэтому **`TP2_PCT < TP2_TRIGGER_PCT`**.
 - `OPEN_LEAD_MS` — за сколько мс до времени открывать (по умолчанию 5000 = 5 секунд).
 - `DEFAULT_ORDER_TYPE` / `DEFAULT_LIMIT_LEVEL` — тип ордера и уровень стакана по умолчанию.
 - `OPEN_IMMEDIATELY=true` — открыть все группы сразу при старте (для теста).
-- `WS_PROXY` — опциональный прокси для публичного ценового WS.
+- `TEST_OPEN_AFTER` — **тестовый разовый запуск**: открыть один раз через заданное время после
+  старта (напр. `30m`, `1h`, `90s`, `1h30m`; голое число = минуты). Переопределяет недельное
+  расписание (но `OPEN_IMMEDIATELY` приоритетнее). Пусто = выключено.
+- **MongoDB (источник групп, опционально)**: `DATABASE_URL` (строка подключения; пусто = выключено),
+  `SERVER_NUMBER` (номер этого сервера), `LISTINGS_EVENT_SINGLE` / `LISTINGS_EVENT_MULTI`
+  (по умолчанию `silver_onemode` / `silver_multimode`), `LISTINGS_POLL_MS` (по умолчанию 300000 = 5 мин),
+  `LISTINGS_EXCHANGE` (по умолчанию `mexc`), `LISTINGS_USER_ID` (опц. фильтр по владельцу),
+  `MONGO_DB_NAME` / `MONGO_LISTINGS_COLLECTION` / `MONGO_ACCOUNTS_COLLECTION`. См. раздел ниже.
+
+## Источник групп: MongoDB (Listings)
+
+Если задан `DATABASE_URL` в `.env`, бот **подключается к той же MongoDB**, что и основное
+приложение, и каждые `LISTINGS_POLL_MS` (по умолчанию 5 минут) тянет коллекцию `Listings`,
+формируя хедж‑группы **на лету**. В этом режиме статические `groups` из `config.json`
+игнорируются (но сам файл всё равно нужен: аккаунты/тюнинги и хотя бы один «загрузочный»
+аккаунт для публичных данных — спецификации контракта и ценового WS).
+
+Как отбираются листинги:
+
+- по `event`: **`silver_onemode`** → режим `single` (один аккаунт держит обе ноги),
+  **`silver_multimode`** → режим `dual` (две ноги на разных аккаунтах). Имена настраиваются
+  через `LISTINGS_EVENT_SINGLE` / `LISTINGS_EVENT_MULTI`.
+- по **номеру сервера**: поле `customFields` (JSON‑строка вида
+  `{"leverage":500,"open_type":1,"server_number":1}`) парсится, и берутся только листинги,
+  у которых `server_number` совпадает с `SERVER_NUMBER` этого сервера.
+- привязанный MEXC‑аккаунт подтягивается из коллекции `Account` по `accountId`
+  (web‑токен берётся из поля `cookie`); опционально фильтр по бирже
+  `LISTINGS_EXCHANGE` (по умолчанию `mexc`) и владельцу `LISTINGS_USER_ID`.
+  **Важно:** в `Account.cookie` основное приложение хранит **всю строку cookie браузера**
+  (`mxc_theme=...; u_id=WEB...; ...`), а MEXC в заголовке `authorization` ждёт **только
+  значение `u_id`** (токен на `WEB...`). Бот автоматически извлекает `u_id` из этой строки —
+  поэтому отдельно «чистить» cookie в БД не нужно. Проверить, что токены реально проходят
+  авторизацию, можно командой `npm run check-listings` (см. ниже).
+
+Из листинга берутся: `margin`, `leverage` и `open_type` (из `customFields`),
+`side` (`long`/`short`). Для `dual` пара собирается по **одинаковому `server_number`**: листинг
+с `side=long` → long‑аккаунт, `side=short` → short‑аккаунт. Остальные параметры (тип ордера,
+уровень стакана, пороги стратегии, `positionMode`) берутся из дефолтов `.env`.
+
+> **Важно про `margin`:** в листингах `margin` — это **финальный размер позиции (нотионал) на
+> ногу в USDT**, а НЕ залог. Если в `margin` стоит `500000`, бот откроет позицию ровно на
+> `500000 USDT` с учётом плеча (залог при этом = `notional / leverage`, напр. при 20x ≈ `25000`).
+> Кол‑во контрактов считается как `margin / (цена × contractSize)` без умножения на плечо.
+> (В статическом `config.json` поле `marginUsdt` — наоборот, это **залог**, и нотионал =
+> `marginUsdt × leverage`.)
+
+Открытие происходит **в то же время по расписанию** (или по `TEST_OPEN_AFTER`): в момент открытия
+бот заново перечитывает `Listings`, открывает все **готовые** планы и логирует пропущенные
+(например, если у `dual` нет второй ноги, протух токен или аккаунт отключён). Активные раны
+персистятся в `data/state.json` (включая авторизацию динамических аккаунтов), поэтому мониторинг
+**возобновляется** после перезапуска.
+
+### Что подтянулось из БД — видно прямо в `config.json`
+
+Чтобы было видно, **какие данные бот тянет из MongoDB и как он их использует**, при каждом
+опросе (и в момент открытия) бот автоматически дописывает в `config.json` секцию **`_live`**
+(только для просмотра — загрузчик её игнорирует, на старт не влияет):
+
+```json
+"_live": {
+  "updatedAt": "2026-06-06T11:58:00.000Z",
+  "source": "mongodb",
+  "serverNumber": 1,
+  "events": { "single": "silver_onemode", "dual": "silver_multimode" },
+  "counts": { "listings": 3, "plans": 2, "ready": 1, "readySingle": 0, "readyDual": 1 },
+  "lastOpen": { "at": "...", "groups": ["listing-s1-dual"] },
+  "plans": [
+    {
+      "mode": "dual", "serverNumber": 1, "symbol": "SILVER_USDT",
+      "margin": 500000, "leverage": 20, "openType": 1,
+      "ready": true, "issues": [], "groupName": "listing-s1-dual",
+      "longAccount":  { "id": "...", "label": "acc_long",  "exchange": "mexc", "webToken": "WEB123…cdef", "usable": true },
+      "shortAccount": { "id": "...", "label": "acc_short", "exchange": "mexc", "webToken": "WEB456…9abc", "usable": true },
+      "willUse": { "sizing": "margin = final position (notional)", "notionalUsdt": 500000, "estCollateralUsdt": 25000,
+                   "orderType": "limit", "limitLevel": 3, "pctBasis": "roe", "positionMode": 1,
+                   "strategy": { "profitTriggerPct": 0.4, "stopLockPct": 0.2, "tp2TriggerPct": 0.4, "tp2Pct": 0.2 } }
+    }
+  ]
+}
+```
+
+- **`plans[].ready` / `issues`** — готов ли план к открытию и, если нет, почему (нет второй ноги,
+  протух токен, аккаунт отключён и т.п.).
+- **`willUse`** — точные параметры, с которыми план превратится в ордер (тип ордера, плечи,
+  пороги стратегии, `positionMode`), плюс `notionalUsdt` (= `margin`, финальный размер позиции)
+  и `estCollateralUsdt` (оценка залога = `notional / leverage`).
+- WEB‑токены в `_live` **маскируются** (`WEB123…cdef`) — секцию безопасно просматривать.
 
 ## Запуск
 
 ```bash
-npm run check     # только чтение: проверить токены, прокси, контракт, WS-цену, время открытия
+npm run check          # только чтение: токены/прокси/контракт/WS-цену статических аккаунтов
+npm run check-listings # только чтение: подтянуть Listings из Mongo, извлечь u_id и LIVE-проверить авторизацию
 npm run open-now [имя_группы]   # вручную открыть одну группу СЕЙЧАС (реальные ордера!)
-npm start         # боевой режим: ждать открытия рынка и работать по расписанию
+npm start              # боевой режим: ждать открытия рынка и работать по расписанию
 ```
+
+> `npm run check` проверяет только аккаунты из `config.json`. Для аккаунтов **из MongoDB**
+> (Listings) используйте `npm run check-listings` — он резолвит планы как боевой режим и делает
+> реальный `open_positions` каждым токеном, показывая `AUTH OK` / `AUTH FAIL`.
 
 ## Безопасность / нюансы
 
@@ -128,10 +246,12 @@ src/
   config.js     — загрузка .env + config.json, валидация
   logger.js     — логгер
   util.js       — sleep/round, PnL% и цены по PnL%
-  proxy.js      — http/https/socks агент на аккаунт
   contracts.js  — кэш спецификаций контракта + размер из маржи + округление цены
-  scheduler.js  — расчёт следующего открытия рынка (luxon, TZ)
+  scheduler.js  — расчёт открытия рынка (luxon, TZ) + разовый тест-таймер (TEST_OPEN_AFTER)
   state.js      — персист активных ранов
+  listings.js   — опрос Listings: фильтр по server_number/event, парсинг customFields, извлечение u_id из cookie, сборка планов
+  db/
+    mongo.js    — подключение к MongoDB (нативный драйвер)
   mexc/
     sign.js     — md5-подпись web-токена
     rest.js     — REST: order/submit, stoporder/place, open_positions, contract/detail, close
@@ -141,6 +261,7 @@ src/
   manager.js    — оркестрация: фид, расписание, группы, мониторы
   index.js      — точка входа
 scripts/
-  check.js      — read-only проверка
-  open-now.js   — ручное открытие группы
+  check.js          — read-only проверка статических аккаунтов
+  check-listings.js — read-only проверка аккаунтов из Mongo (Listings) + live-авторизация
+  open-now.js       — ручное открытие группы
 ```

@@ -86,4 +86,48 @@ function scheduleMarketOpen(cfg, onOpen) {
   };
 }
 
-module.exports = { nextOpenMs, describeNext, scheduleMarketOpen };
+function humanizeDuration(ms) {
+  if (ms == null) return 'n/a';
+  const s = Math.round(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (m) parts.push(`${m}m`);
+  if (sec || !parts.length) parts.push(`${sec}s`);
+  return parts.join(' ');
+}
+
+/**
+ * Fire a ONE-SHOT callback `delayMs` from now. Handles the 32-bit setTimeout cap
+ * by chaining. Returns a stop() function.
+ */
+function scheduleAfter(delayMs, onFire) {
+  let cancelled = false;
+  let timer = null;
+  const delay = Math.max(0, delayMs || 0);
+  const fireAt = Date.now() + delay;
+
+  function tick() {
+    if (cancelled) return;
+    const remaining = fireAt - Date.now();
+    if (remaining > 50) {
+      timer = setTimeout(tick, Math.min(remaining, MAX_TIMEOUT_MS));
+      return;
+    }
+    Promise.resolve()
+      .then(() => onFire())
+      .catch((e) => logger.error(`[scheduler] scheduleAfter onFire error: ${e.message}`));
+  }
+
+  timer = setTimeout(tick, Math.min(delay, MAX_TIMEOUT_MS));
+  return () => {
+    cancelled = true;
+    if (timer) clearTimeout(timer);
+  };
+}
+
+module.exports = { nextOpenMs, describeNext, scheduleMarketOpen, scheduleAfter, humanizeDuration };

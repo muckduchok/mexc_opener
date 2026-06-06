@@ -46,6 +46,19 @@ async function openHedge(group, { getRest, contracts, feed }) {
   let vol;
   if (group.volContracts != null) {
     vol = Math.max(spec.minVol, Math.floor(group.volContracts / spec.volUnit) * spec.volUnit);
+  } else if (group.notionalUsdt != null) {
+    // notionalUsdt = the FINAL position value (e.g. from the DB `margin` field):
+    // open exactly this position size; collateral used = notional / leverage.
+    const sized = contracts.contractsFromNotional(spec, {
+      notionalUsdt: group.notionalUsdt,
+      leverage: group.leverage,
+      price,
+    });
+    vol = sized.vol;
+    logger.info(
+      `[hedge ${group.name}] sizing: target position ${group.notionalUsdt} USDT (final) x${group.leverage} @${price} -> ${vol} contracts ` +
+        `(notional ~${sized.notional.toFixed(2)} USDT, est collateral ~${sized.marginUsed != null ? sized.marginUsed.toFixed(2) : '?'} USDT)`
+    );
   } else {
     const sized = contracts.contractsFromMargin(spec, {
       marginUsdt: group.marginUsdt,
@@ -71,9 +84,13 @@ async function openHedge(group, { getRest, contracts, feed }) {
     );
   }
 
+  const layout =
+    group.mode === 'single'
+      ? `LONG+SHORT both on ${group.longAccount} (single-account hedge)`
+      : `LONG on ${group.longAccount} + SHORT on ${group.shortAccount}`;
   logger.info(
-    `[hedge ${group.name}] opening LONG ${vol} on ${group.longAccount} + SHORT ${vol} on ${group.shortAccount} ` +
-      `(${symbol}, lev ${group.leverage}, openType ${group.openType}, ${isLimit ? 'LIMIT' : 'MARKET'})`
+    `[hedge ${group.name}] opening ${vol} contracts: ${layout} ` +
+      `(${symbol}, lev ${group.leverage}, openType ${group.openType}, posMode ${positionMode}, ${isLimit ? 'LIMIT' : 'MARKET'})`
   );
 
   const openLeg = (rest, side, limitPrice) =>
@@ -137,7 +154,7 @@ async function openHedge(group, { getRest, contracts, feed }) {
     winner: null,
     loser: null,
     slPlaced: false,
-    tpPlaced: false,
+    tp2SlPlaced: false,
   };
 
   logger.info(

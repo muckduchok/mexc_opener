@@ -2,7 +2,6 @@
 
 const EventEmitter = require('events');
 const WebSocket = require('ws');
-const { buildProxyAgent } = require('../proxy');
 const { safeNum } = require('../util');
 const logger = require('../logger');
 
@@ -16,11 +15,10 @@ const MAX_BACKOFF_MS = 30000;
  *   'open', 'close', 'error'
  */
 class PriceFeed extends EventEmitter {
-  constructor({ wsUrl, proxy, priceSource = 'last' } = {}) {
+  constructor({ wsUrl, priceSource = 'last' } = {}) {
     super();
     this.setMaxListeners(0); // many hedge monitors may subscribe to 'price'
     this.wsUrl = wsUrl || 'wss://contract.mexc.com/edge';
-    this.proxy = proxy || null;
     this.priceSource = priceSource;
     this.symbols = new Set();
     this.latest = new Map(); // symbol -> { price, last, fair, bid, ask, ts }
@@ -67,10 +65,8 @@ class PriceFeed extends EventEmitter {
   }
 
   _connect() {
-    const agent = buildProxyAgent(this.proxy);
-    const opts = agent ? { agent } : {};
-    logger.info(`[ws] connecting to ${this.wsUrl}${this.proxy ? ' (via proxy)' : ''}`);
-    const ws = new WebSocket(this.wsUrl, opts);
+    logger.info(`[ws] connecting to ${this.wsUrl}`);
+    const ws = new WebSocket(this.wsUrl);
     this.ws = ws;
 
     ws.on('open', () => {
