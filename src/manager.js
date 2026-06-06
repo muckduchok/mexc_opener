@@ -138,9 +138,11 @@ class Manager {
       );
       this.cancelSchedule = scheduleAfter(ms, () => this.openScheduled());
     } else {
+      // resolve the wake lead dynamically from secondstoopen at each (re)arm
+      config.schedule.getLeadMs = () => this._computeLeadMs();
       const next = describeNext(config.schedule);
-      logger.info(`[manager] scheduled. Next market open: ${next.human}`);
-      this.cancelSchedule = scheduleMarketOpen(config.schedule, () => this.openScheduled());
+      logger.info(`[manager] scheduled. Next market open: ${next.human} (lead ${this._computeLeadMs()}ms from secondstoopen)`);
+      this.cancelSchedule = scheduleMarketOpen(config.schedule, (n) => this.openScheduled(n));
     }
   }
 
@@ -161,18 +163,19 @@ class Manager {
     }
   }
 
-  async openAllGroups() {
+  async openAllGroups({ targetMs = null } = {}) {
     logger.info(`[manager] === MARKET OPEN: opening ${this.config.groups.length} group(s) ===`);
     // open all groups concurrently; each group opens its two legs in parallel
-    await Promise.allSettled(this.config.groups.map((g) => this.openGroup(g)));
+    await Promise.allSettled(this.config.groups.map((g) => this.openGroup(g, { targetMs })));
   }
 
-  async openGroup(group) {
+  async openGroup(group, { targetMs = null } = {}) {
     try {
       const run = await openHedge(group, {
         getRest: this.getRest,
         contracts: this.contracts,
         feed: this.feed,
+        targetMs,
       });
       // persist auth for runtime accounts so the run can be resumed after restart
       for (const legKey of ['long', 'short']) {
@@ -249,6 +252,10 @@ class Manager {
       orderType: d.orderType,
       limitLevel: d.limitLevel,
       pctBasis: d.pctBasis,
+      // gradual accumulation + timing (per-listing overrides fall back to env defaults)
+      openChunks: plan.openChunks != null ? plan.openChunks : d.openChunks,
+      secondsToOpen: plan.secondsToOpen != null ? plan.secondsToOpen : d.secondsToOpen,
+      withoutSl: !!plan.withoutSl,
       strategy: { ...this.config.strategyDefaults },
       source: 'listing',
     };
@@ -306,6 +313,9 @@ class Manager {
       limitLevel: d.limitLevel,
       pctBasis: d.pctBasis,
       positionMode: plan.mode === 'single' ? 1 : d.positionMode,
+      openChunks: plan.openChunks != null ? plan.openChunks : d.openChunks,
+      secondsToOpen: plan.secondsToOpen != null ? plan.secondsToOpen : d.secondsToOpen,
+      withoutSl: !!plan.withoutSl,
       strategy: { ...this.config.strategyDefaults },
     };
     return view;
@@ -352,7 +362,7 @@ class Manager {
    * Open hedges from the current Listings plans. Re-pulls fresh plans at open
    * time, opens every READY plan, and logs the ones skipped (not ready).
    */
-  async openFromListings() {
+  async openFromListings({ targetMs = null } = {}) {
     if (!this.mongo.enabled) return [];
     let plans = [];
     try {
@@ -384,22 +394,47 @@ class Manager {
     const groups = ready.map((p) => this._planToGroup(p));
     this.lastOpen = { at: new Date().toISOString(), groups: groups.map((g) => g.name) };
     this.writeLiveConfig();
-    return Promise.allSettled(groups.map((g) => this.openGroup(g)));
+    return Promise.allSettled(groups.map((g) => this.openGroup(g, { targetMs })));
   }
 
   /**
    * Market-open entrypoint. When MongoDB is configured, opens from Listings
    * plans; otherwise opens the static config.json groups.
    */
-  async openScheduled() {
+  async openScheduled(next = null) {
+    // `next` (from the scheduler) carries the logical open instant (epoch ms);
+    // each plan begins opening `secondstoopen` before it.
+    const targetMs = next && next.ms != null ? next.ms : null;
     if (this.mongo.enabled) {
       if (this.config.groups.length) {
         logger.info(`[manager] mongo-driven: ${this.config.groups.length} static config group(s) are ignored`);
       }
-      await this.openFromListings();
+      await this.openFromListings({ targetMs });
     } else {
-      await this.openAllGroups();
+      await this.openAllGroups({ targetMs });
     }
+  }
+
+  // Wake the scheduler this many ms BEFORE the logical open: the largest
+  // secondstoopen across the active source (so the plan needing the most lead
+  // begins on time). Falls back to OPEN_LEAD_MS when nothing is known yet.
+  _computeLeadMs() {
+    const fallback = Math.max(0, this.config.schedule.leadMs || 0);
+    let maxSeconds = 0;
+    if (this.mongo.enabled) {
+      const plans = (this.latestListings && this.latestListings.plans) || [];
+      for (const p of plans) {
+        if (!p.ready) continue;
+        const s = p.secondsToOpen != null ? p.secondsToOpen : this.config.groupDefaults.secondsToOpen;
+        if (s > maxSeconds) maxSeconds = s;
+      }
+    } else {
+      for (const g of this.config.groups) {
+        if (g.secondsToOpen > maxSeconds) maxSeconds = g.secondsToOpen;
+      }
+    }
+    const leadMs = Math.round(maxSeconds * 1000);
+    return leadMs > 0 ? leadMs : fallback;
   }
 
   /**

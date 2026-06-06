@@ -45,7 +45,9 @@ class HedgeMonitor {
   start() {
     const run = this.run;
     logger.info(
-      `[monitor ${run.id}] start phase=${run.phase} basis=${run.pctBasis} lev=${run.leverage} long=${run.long.account}@${run.long.entry} short=${run.short.account}@${run.short.entry}`
+      `[monitor ${run.id}] start phase=${run.phase} basis=${run.pctBasis} lev=${run.leverage} ` +
+        `long=${run.long.account}@${run.long.entry} short=${run.short.account}@${run.short.entry}` +
+        `${run.withoutSl ? ' [HOLD ONLY: without_sl — no SL/TP placed]' : ''}`
     );
     this.feed.subscribe(run.symbol);
     this.feed.on('price', this._priceHandler);
@@ -115,6 +117,9 @@ class HedgeMonitor {
     if (!price) return;
 
     this._logPnl(price);
+
+    // without_sl: just hold both legs and log PnL — never place any stop-loss.
+    if (run.withoutSl) return;
 
     if (run.phase === PHASE.WATCHING) {
       const pl = this.legPnl('long', price);

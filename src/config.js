@@ -163,6 +163,16 @@ function load() {
   const defLimitLevel = envNum('DEFAULT_LIMIT_LEVEL', 3);
   const defPctBasis = normPctBasis(envStr('DEFAULT_PCT_BASIS', 'roe'));
   const defHedgeMode = normHedgeMode(envStr('DEFAULT_HEDGE_MODE', 'dual'));
+  // Gradual accumulation: split each leg's target size into this many chunks,
+  // submitted over the first half of the open window (1 = single shot).
+  const defOpenChunks = envNum('OPEN_CHUNKS', 5);
+  // How many seconds BEFORE the target time to begin opening; the position is
+  // accumulated over the FIRST HALF of this window. Per-listing override:
+  // customFields.secondstoopen.
+  const defSecondsToOpen = envNum('DEFAULT_SECONDS_TO_OPEN', 20);
+  // When true, place NO stop-losses on either leg. Per-listing override:
+  // customFields.without_sl.
+  const defWithoutSl = envBool('DEFAULT_WITHOUT_SL', false);
 
   // ── groups ────────────────────────────────────────────────────────────────────
   const groups = [];
@@ -234,6 +244,13 @@ function load() {
     if (!['roe', 'price'].includes(pctBasis))
       fail(`group "${name}": pctBasis must be "roe" or "price"`);
 
+    const openChunks = g.openChunks != null ? Number(g.openChunks) : defOpenChunks;
+    if (!(Number.isInteger(openChunks) && openChunks >= 1))
+      fail(`group "${name}": openChunks must be an integer >= 1`);
+    const secondsToOpen = g.secondsToOpen != null ? Number(g.secondsToOpen) : defSecondsToOpen;
+    if (!(secondsToOpen >= 0)) fail(`group "${name}": secondsToOpen must be >= 0`);
+    const withoutSl = g.withoutSl != null ? !!g.withoutSl : defWithoutSl;
+
     groups.push({
       name,
       symbol,
@@ -248,6 +265,9 @@ function load() {
       orderType,
       limitLevel,
       pctBasis,
+      openChunks,
+      secondsToOpen,
+      withoutSl,
       strategy,
     });
   }
@@ -277,6 +297,9 @@ function load() {
       limitLevel: defLimitLevel,
       pctBasis: defPctBasis,
       hedgeMode: defHedgeMode,
+      openChunks: defOpenChunks,
+      secondsToOpen: defSecondsToOpen,
+      withoutSl: defWithoutSl,
     },
     schedule: {
       tz: envStr('MARKET_OPEN_TZ', 'Europe/Warsaw'),

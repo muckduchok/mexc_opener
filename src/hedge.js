@@ -23,15 +23,31 @@ async function resolveLegPosition(rest, symbol, side /* 'long'|'short' */, { att
  * Returns a `run` object ready for HedgeMonitor, or throws on failure (after
  * attempting to unwind any single leg that did open).
  */
-async function openHedge(group, { getRest, contracts, feed }) {
+async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
   const { symbol } = group;
   const tOpen0 = Date.now(); // overall open-latency clock
   const spec = await contracts.get(symbol);
   const longRest = getRest(group.longAccount);
   const shortRest = getRest(group.shortAccount);
   const positionMode = group.positionMode || 1;
+  const isLimit = group.orderType === 'limit';
 
-  // reference price for sizing
+  // ── accumulation timing (secondstoopen) ───────────────────────────────────
+  // Begin opening `secondsToOpen` before the target instant; accumulate the
+  // position over the FIRST HALF of that window (the second half is buffer so
+  // the full size is in place before the target). With no target (immediate /
+  // test opens) start now.
+  const secondsToOpen = group.secondsToOpen > 0 ? group.secondsToOpen : 0;
+  const startAtMs =
+    targetMs != null && secondsToOpen > 0 ? targetMs - secondsToOpen * 1000 : Date.now();
+  const accumulateMs = Math.max(0, Math.round((secondsToOpen / 2) * 1000));
+  const waitMs = startAtMs - Date.now();
+  if (waitMs > 0) {
+    logger.info(`[hedge ${group.name}] waiting ${waitMs}ms to begin opening (${secondsToOpen}s before target)`);
+    await sleep(waitMs);
+  }
+
+  // reference price for sizing (fresh, right before accumulation)
   let price = feed.getPrice(symbol);
   if (!price) {
     try {
@@ -43,10 +59,10 @@ async function openHedge(group, { getRest, contracts, feed }) {
   }
   if (!price) throw new Error(`no price available for ${symbol} to size order`);
 
-  // volume (same on both legs)
-  let vol;
+  // total target volume (same on both legs)
+  let totalVol;
   if (group.volContracts != null) {
-    vol = Math.max(spec.minVol, Math.floor(group.volContracts / spec.volUnit) * spec.volUnit);
+    totalVol = Math.max(spec.minVol, Math.floor(group.volContracts / spec.volUnit) * spec.volUnit);
   } else if (group.notionalUsdt != null) {
     // notionalUsdt = the FINAL position value (e.g. from the DB `margin` field):
     // open exactly this position size; collateral used = notional / leverage.
@@ -55,9 +71,9 @@ async function openHedge(group, { getRest, contracts, feed }) {
       leverage: group.leverage,
       price,
     });
-    vol = sized.vol;
+    totalVol = sized.vol;
     logger.info(
-      `[hedge ${group.name}] sizing: target position ${group.notionalUsdt} USDT (final) x${group.leverage} @${price} -> ${vol} contracts ` +
+      `[hedge ${group.name}] sizing: target position ${group.notionalUsdt} USDT (final) x${group.leverage} @${price} -> ${totalVol} contracts ` +
         `(notional ~${sized.notional.toFixed(2)} USDT, est collateral ~${sized.marginUsed != null ? sized.marginUsed.toFixed(2) : '?'} USDT)`
     );
   } else {
@@ -66,68 +82,89 @@ async function openHedge(group, { getRest, contracts, feed }) {
       leverage: group.leverage,
       price,
     });
-    vol = sized.vol;
+    totalVol = sized.vol;
     logger.info(
-      `[hedge ${group.name}] sizing: margin ${group.marginUsdt} USDT x${group.leverage} @${price} -> ${vol} contracts (notional ~${sized.notional.toFixed(2)} USDT)`
+      `[hedge ${group.name}] sizing: margin ${group.marginUsdt} USDT x${group.leverage} @${price} -> ${totalVol} contracts (notional ~${sized.notional.toFixed(2)} USDT)`
     );
   }
 
-  // marketable limit prices from the order book (buy crosses into asks, sell into bids)
-  const isLimit = group.orderType === 'limit';
-  let longPrice = null;
-  let shortPrice = null;
-  if (isLimit) {
-    const prices = await computeLimitPrices(longRest, symbol, spec, contracts, group.limitLevel, group.name);
-    longPrice = prices.longPrice;
-    shortPrice = prices.shortPrice;
-    logger.info(
-      `[hedge ${group.name}] marketable limit (level ${group.limitLevel}): LONG buy @${longPrice} (ask${group.limitLevel}), SHORT sell @${shortPrice} (bid${group.limitLevel})`
-    );
-  }
+  // ── split the target size into chunks (don't dump the whole size at once) ──
+  const wantChunks = Number.isInteger(group.openChunks) && group.openChunks > 0 ? group.openChunks : 1;
+  // never make a chunk smaller than minVol
+  const maxChunksBySize = Math.max(1, Math.floor(totalVol / spec.minVol));
+  const nChunks = Math.min(wantChunks, maxChunksBySize);
+  const chunkVols = splitVol(totalVol, nChunks, spec.volUnit);
+  const interval = nChunks > 1 ? Math.floor(accumulateMs / nChunks) : 0;
 
   const layout =
     group.mode === 'single'
       ? `LONG+SHORT both on ${group.longAccount} (single-account hedge)`
       : `LONG on ${group.longAccount} + SHORT on ${group.shortAccount}`;
   logger.info(
-    `[hedge ${group.name}] opening ${vol} contracts: ${layout} ` +
+    `[hedge ${group.name}] accumulating ${totalVol} contracts in ${nChunks} chunk(s) over ${accumulateMs}ms ` +
+      `(interval ${interval}ms, chunks [${chunkVols.join(', ')}]): ${layout} ` +
       `(${symbol}, lev ${group.leverage}, openType ${group.openType}, posMode ${positionMode}, ${isLimit ? 'LIMIT' : 'MARKET'})`
   );
 
-  const openLeg = (rest, side, limitPrice) =>
-    isLimit
-      ? rest.submitLimitOpen({ symbol, side, vol, leverage: group.leverage, openType: group.openType, positionMode, price: limitPrice })
-      : rest.submitMarketOpen({ symbol, side, vol, leverage: group.leverage, openType: group.openType, positionMode });
-
-  // time each leg's submit round-trip individually so we can see per-account latency
-  const timedOpen = async (rest, side, limitPrice, label, acct) => {
-    const t = Date.now();
-    try {
-      const r = await openLeg(rest, side, limitPrice);
-      logger.info(`[hedge ${group.name}] ${label} order acked on ${acct} in ${Date.now() - t}ms`);
-      return r;
-    } catch (e) {
-      logger.warn(`[hedge ${group.name}] ${label} order on ${acct} errored after ${Date.now() - t}ms: ${e.message}`);
-      throw e;
+  // Submit one chunk of both legs in parallel. Marketable limit prices are
+  // recomputed fresh per chunk so we stay marketable as the book moves.
+  const submitChunk = async (cv, idx) => {
+    let longPrice = null;
+    let shortPrice = null;
+    if (isLimit) {
+      const prices = await computeLimitPrices(longRest, symbol, spec, contracts, group.limitLevel, group.name);
+      longPrice = prices.longPrice;
+      shortPrice = prices.shortPrice;
     }
+    const openLeg = (rest, side, limitPrice) =>
+      isLimit
+        ? rest.submitLimitOpen({ symbol, side, vol: cv, leverage: group.leverage, openType: group.openType, positionMode, price: limitPrice })
+        : rest.submitMarketOpen({ symbol, side, vol: cv, leverage: group.leverage, openType: group.openType, positionMode });
+    const t = Date.now();
+    const [lr, sr] = await Promise.allSettled([
+      openLeg(longRest, SIDE.OPEN_LONG, longPrice),
+      openLeg(shortRest, SIDE.OPEN_SHORT, shortPrice),
+    ]);
+    const longOk = lr.status === 'fulfilled';
+    const shortOk = sr.status === 'fulfilled';
+    if (!longOk) logger.warn(`[hedge ${group.name}] chunk ${idx + 1}/${nChunks} LONG failed: ${lr.reason.message}`);
+    if (!shortOk) logger.warn(`[hedge ${group.name}] chunk ${idx + 1}/${nChunks} SHORT failed: ${sr.reason.message}`);
+    logger.info(
+      `[hedge ${group.name}] chunk ${idx + 1}/${nChunks} ${cv} contracts in ${Date.now() - t}ms ` +
+        `(long ok=${longOk}, short ok=${shortOk}${isLimit ? `, @${longPrice}/${shortPrice}` : ''})`
+    );
+    return { longVol: longOk ? cv : 0, shortVol: shortOk ? cv : 0 };
   };
 
-  // fire both legs in parallel
   const tSubmit = Date.now();
-  const [longRes, shortRes] = await Promise.allSettled([
-    timedOpen(longRest, SIDE.OPEN_LONG, longPrice, 'LONG', group.longAccount),
-    timedOpen(shortRest, SIDE.OPEN_SHORT, shortPrice, 'SHORT', group.shortAccount),
-  ]);
+  const accStart = Date.now();
+  let longSubmitted = 0;
+  let shortSubmitted = 0;
+  for (let i = 0; i < nChunks; i++) {
+    if (i > 0 && interval > 0) {
+      // schedule against an absolute clock so per-chunk drift doesn't accumulate
+      const dt = accStart + i * interval - Date.now();
+      if (dt > 0) await sleep(dt);
+    }
+    try {
+      const r = await submitChunk(chunkVols[i], i);
+      longSubmitted += r.longVol;
+      shortSubmitted += r.shortVol;
+    } catch (e) {
+      logger.warn(`[hedge ${group.name}] chunk ${i + 1}/${nChunks} errored: ${e.message}`);
+    }
+  }
   const submitMs = Date.now() - tSubmit;
 
-  const longOk = longRes.status === 'fulfilled';
-  const shortOk = shortRes.status === 'fulfilled';
-
-  if (!longOk || !shortOk) {
-    if (!longOk) logger.error(`[hedge ${group.name}] LONG open failed: ${longRes.reason.message}`);
-    if (!shortOk) logger.error(`[hedge ${group.name}] SHORT open failed: ${shortRes.reason.message}`);
+  if (longSubmitted === 0 || shortSubmitted === 0) {
+    logger.error(`[hedge ${group.name}] accumulation produced no orders on a leg (long=${longSubmitted}, short=${shortSubmitted}); aborting & cleaning up`);
     await abortHedge({ longRest, shortRest, symbol, groupName: group.name, isLimit });
-    throw new Error(`hedge ${group.name}: failed to open both legs (long ok=${longOk}, short ok=${shortOk})`);
+    throw new Error(`hedge ${group.name}: accumulation failed (long=${longSubmitted}, short=${shortSubmitted})`);
+  }
+  if (longSubmitted !== shortSubmitted) {
+    logger.warn(
+      `[hedge ${group.name}] LEG IMBALANCE after accumulation: long submitted ${longSubmitted} vs short ${shortSubmitted} contracts (manage the difference manually)`
+    );
   }
 
   // resolve real positions (entry price + positionId). Marketable limits fill
@@ -164,18 +201,20 @@ async function openHedge(group, { getRest, contracts, feed }) {
     strategy: group.strategy,
     leverage: group.leverage,
     pctBasis: group.pctBasis,
-    vol,
+    // when true the monitor places NO stop-losses — it just holds + logs PnL
+    withoutSl: !!group.withoutSl,
+    vol: totalVol,
     long: {
       account: group.longAccount,
       positionId: longPos.positionId,
       entry: safeNum(longPos.openAvgPrice || longPos.holdAvgPrice, price),
-      vol: safeNum(longPos.holdVol, vol),
+      vol: safeNum(longPos.holdVol, longSubmitted),
     },
     short: {
       account: group.shortAccount,
       positionId: shortPos.positionId,
       entry: safeNum(shortPos.openAvgPrice || shortPos.holdAvgPrice, price),
-      vol: safeNum(shortPos.holdVol, vol),
+      vol: safeNum(shortPos.holdVol, shortSubmitted),
     },
     phase: PHASE.WATCHING,
     winner: null,
@@ -185,10 +224,30 @@ async function openHedge(group, { getRest, contracts, feed }) {
   };
 
   logger.info(
-    `[hedge ${group.name}] OPENED run ${run.id} in ${Date.now() - tOpen0}ms (submit ${submitMs}ms, fill ${fillMs}ms): ` +
-      `long entry ${run.long.entry} (pos ${run.long.positionId}), short entry ${run.short.entry} (pos ${run.short.positionId})`
+    `[hedge ${group.name}] OPENED run ${run.id} in ${Date.now() - tOpen0}ms (submit ${submitMs}ms, fill ${fillMs}ms` +
+      `${group.withoutSl ? ', SL DISABLED (without_sl)' : ''}): ` +
+      `long entry ${run.long.entry} (pos ${run.long.positionId}, ${run.long.vol}), ` +
+      `short entry ${run.short.entry} (pos ${run.short.positionId}, ${run.short.vol})`
   );
   return run;
+}
+
+/**
+ * Split a total contract volume into `n` chunks aligned to `unit`. Each chunk
+ * gets an equal floored share; the LAST chunk absorbs the remainder so the
+ * pieces sum EXACTLY to `total`.
+ */
+function splitVol(total, n, unit) {
+  const u = unit > 0 ? unit : 1;
+  const per = Math.floor(total / n / u) * u;
+  const vols = [];
+  let assigned = 0;
+  for (let i = 0; i < n; i++) {
+    const v = i === n - 1 ? total - assigned : per;
+    vols.push(v);
+    assigned += v;
+  }
+  return vols;
 }
 
 /**
@@ -258,4 +317,4 @@ async function safeClose(rest, position, groupName) {
   }
 }
 
-module.exports = { openHedge, resolveLegPosition };
+module.exports = { openHedge, resolveLegPosition, splitVol };

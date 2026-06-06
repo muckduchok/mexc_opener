@@ -46,10 +46,12 @@ function scheduleMarketOpen(cfg, onOpen) {
   let cancelled = false;
   let timer = null;
 
-  const leadMs = Math.max(0, cfg.leadMs || 0);
-
   function arm(fromMs = Date.now()) {
     if (cancelled) return;
+    // Resolve the lead fresh at each (re)arm: callers may supply a dynamic
+    // `getLeadMs()` (e.g. derived from per-listing secondstoopen). Falls back to
+    // the static `cfg.leadMs`.
+    const leadMs = Math.max(0, (typeof cfg.getLeadMs === 'function' ? cfg.getLeadMs() : cfg.leadMs) || 0);
     const next = describeNext(cfg, fromMs);
     // fire `leadMs` BEFORE the logical open time (e.g. 5s early)
     const fireAt = next.ms - leadMs;

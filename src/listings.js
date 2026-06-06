@@ -25,6 +25,14 @@ function numOrNull(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Coerce a customFields value (boolean, or the strings "true"/"1"/"yes") to a
+// boolean. Anything else (incl. null/undefined) -> false.
+function boolish(v) {
+  if (typeof v === 'boolean') return v;
+  if (v == null) return false;
+  return ['1', 'true', 'yes', 'on'].includes(String(v).trim().toLowerCase());
+}
+
 // numeric compare when both look numeric, else string compare
 function sameServer(a, b) {
   if (a == null || b == null) return false;
@@ -226,6 +234,13 @@ class ListingsWatcher extends EventEmitter {
         margin: numOrNull(l.margin), // FINAL position value (notional USDT) per leg, from the listing
         leverage: numOrNull(cf.leverage), // from customFields
         openType: numOrNull(cf.open_type), // 1=isolated, 2=cross, from customFields
+        // when true, place NO stop-losses on either leg (just hold the hedge)
+        withoutSl: boolish(cf.without_sl),
+        // seconds BEFORE the target time to begin opening; position is accumulated
+        // over the first half of this window
+        secondsToOpen: numOrNull(cf.secondstoopen),
+        // optional per-listing override for the number of accumulation chunks
+        openChunks: numOrNull(cf.open_chunks),
         takeProfit: l.takeProfit != null ? l.takeProfit : null,
         customFields: cf,
         account: normalizeAccount(accDoc),
@@ -253,6 +268,9 @@ class ListingsWatcher extends EventEmitter {
         margin: it.margin,
         leverage: it.leverage,
         openType: it.openType,
+        withoutSl: it.withoutSl,
+        secondsToOpen: it.secondsToOpen,
+        openChunks: it.openChunks,
         side: it.side,
         account: it.account,
         longAccount: it.account,
@@ -281,6 +299,9 @@ class ListingsWatcher extends EventEmitter {
         margin: canon ? canon.margin : null,
         leverage: canon ? canon.leverage : null,
         openType: canon ? canon.openType : null,
+        withoutSl: canon ? canon.withoutSl : false,
+        secondsToOpen: canon ? canon.secondsToOpen : null,
+        openChunks: canon ? canon.openChunks : null,
         long,
         short,
         longAccount: long ? long.account : null,
@@ -346,7 +367,8 @@ class ListingsWatcher extends EventEmitter {
           : `long=${label(p.longAccount)} short=${label(p.shortAccount)}`;
       logger.info(
         `[listings]   ${p.mode} srv=${p.serverNumber} ${p.symbol} ${who} ` +
-          `margin=${p.margin} lev=${p.leverage} openType=${p.openType} -> ${status}`
+          `margin=${p.margin} lev=${p.leverage} openType=${p.openType} ` +
+          `withoutSl=${!!p.withoutSl} secondsToOpen=${p.secondsToOpen != null ? p.secondsToOpen : 'def'} -> ${status}`
       );
     }
   }
