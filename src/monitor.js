@@ -25,18 +25,20 @@ class HedgeMonitor {
    *   feed: PriceFeed, state: StateStore, pollMs, onDone(run)
    * }
    */
-  constructor({ run, getRest, contracts, feed, state, pollMs = 3000, onDone }) {
+  constructor({ run, getRest, contracts, feed, state, pollMs = 3000, pnlLogMs = 2000, onDone }) {
     this.run = run;
     this.getRest = getRest;
     this.contracts = contracts;
     this.feed = feed;
     this.state = state;
     this.pollMs = pollMs;
+    this.pnlLogMs = pnlLogMs;
     this.onDone = onDone || (() => {});
     this.busy = false;
     this.polling = false;
     this.done = false;
     this.pollTimer = null;
+    this._lastPnlLog = 0;
     this._priceHandler = (rec) => this._onPrice(rec);
   }
 
@@ -82,6 +84,28 @@ class HedgeMonitor {
     return legPnlPct(which, leg.entry, price) * this._factor();
   }
 
+  // Throttled live PnL log: shows the per-account PnL of every still-open leg.
+  _logPnl(price) {
+    const now = Date.now();
+    if (now - this._lastPnlLog < this.pnlLogMs) return;
+    const run = this.run;
+    let legs;
+    if (run.phase === PHASE.WATCHING || run.phase === PHASE.ARMED_FIRST) {
+      legs = ['long', 'short']; // both legs still open
+    } else if ((run.phase === PHASE.SECOND_LEG || run.phase === PHASE.ARMED_SECOND) && run.loser) {
+      legs = [run.loser]; // winner already closed; only the loser leg remains
+    } else {
+      return;
+    }
+    this._lastPnlLog = now;
+    const parts = legs.map((w) => {
+      const leg = run[w];
+      const pnl = this.legPnl(w, price);
+      return `${w} ${leg.account}: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(3)}% ${run.pctBasis} (entry ${leg.entry})`;
+    });
+    logger.info(`[monitor ${run.id}] PnL @${price} (+${((now - run.openedAt) / 1000).toFixed(0)}s) | ${parts.join(' | ')}`);
+  }
+
   // ── price-driven order placement ───────────────────────────────────────────
   async _onPrice(rec) {
     const run = this.run;
@@ -89,6 +113,8 @@ class HedgeMonitor {
     if (this.busy) return;
     const price = rec.price;
     if (!price) return;
+
+    this._logPnl(price);
 
     if (run.phase === PHASE.WATCHING) {
       const pl = this.legPnl('long', price);
@@ -126,19 +152,24 @@ class HedgeMonitor {
         `[monitor ${run.id}] ${winner.toUpperCase()} hit +${run.strategy.profitTriggerPct}% ${run.pctBasis} (pnl@${price}). ` +
           `Placing SL lock @+${run.strategy.stopLockPct}% ${run.pctBasis} -> price ${slPrice} on ${leg.account} pos ${leg.positionId}`
       );
+      const tPlace = Date.now();
       await rest.placeTpSlByPosition({
         symbol: run.symbol,
         positionId: leg.positionId,
         vol: leg.vol,
         stopLossPrice: slPrice,
       });
+      const placeMs = Date.now() - tPlace;
       run.winner = winner;
       run.loser = loser;
       run.slPrice = slPrice;
       run.slPlaced = true;
       run.phase = PHASE.ARMED_FIRST;
       this.state.upsertRun(run);
-      logger.info(`[monitor ${run.id}] SL placed. phase -> armed_first (waiting for ${winner} to fill)`);
+      logger.info(
+        `[monitor ${run.id}] SL placed in ${placeMs}ms (trigger fired +${Date.now() - run.openedAt}ms after open). ` +
+          `phase -> armed_first (waiting for ${winner} to fill)`
+      );
     } catch (e) {
       logger.error(`[monitor ${run.id}] failed to place SL on winner: ${e.message}`);
     } finally {
@@ -167,17 +198,21 @@ class HedgeMonitor {
         `[monitor ${run.id}] ${loser.toUpperCase()} reached +${run.strategy.tp2TriggerPct}% ${run.pctBasis} (pnl@${price}). ` +
           `Placing SL lock @+${run.strategy.tp2Pct}% ${run.pctBasis} -> price ${slPrice} on ${leg.account} pos ${leg.positionId}`
       );
+      const tPlace = Date.now();
       await rest.placeTpSlByPosition({
         symbol: run.symbol,
         positionId: leg.positionId,
         vol: leg.vol,
         stopLossPrice: slPrice,
       });
+      const placeMs = Date.now() - tPlace;
       run.tp2SlPrice = slPrice;
       run.tp2SlPlaced = true;
       run.phase = PHASE.ARMED_SECOND;
       this.state.upsertRun(run);
-      logger.info(`[monitor ${run.id}] 2nd-leg SL placed. phase -> armed_second (waiting for ${loser} to fill)`);
+      logger.info(
+        `[monitor ${run.id}] 2nd-leg SL placed in ${placeMs}ms. phase -> armed_second (waiting for ${loser} to fill)`
+      );
     } catch (e) {
       logger.error(`[monitor ${run.id}] failed to place 2nd-leg SL on loser: ${e.message}`);
     } finally {

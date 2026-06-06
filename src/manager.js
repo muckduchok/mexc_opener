@@ -197,6 +197,7 @@ class Manager {
       feed: this.feed,
       state: this.state,
       pollMs: this.config.runtime.positionPollMs,
+      pnlLogMs: this.config.runtime.pnlLogMs,
       onDone: (r) => {
         this.monitors.delete(r.id);
         this.state.removeRun(r.id);

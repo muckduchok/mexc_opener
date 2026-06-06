@@ -328,6 +328,8 @@ function load() {
       positionPollMs: envNum('POSITION_POLL_MS', 3000),
       httpTimeoutMs: envNum('HTTP_TIMEOUT_MS', 15000),
       stateFile: envStr('STATE_FILE', 'data/state.json'),
+      // how often (ms) to log live per-account PnL while a hedge is open.
+      pnlLogMs: envNum('PNL_LOG_MS', 2000),
     },
   };
 }

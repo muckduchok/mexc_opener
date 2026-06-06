@@ -25,6 +25,7 @@ async function resolveLegPosition(rest, symbol, side /* 'long'|'short' */, { att
  */
 async function openHedge(group, { getRest, contracts, feed }) {
   const { symbol } = group;
+  const tOpen0 = Date.now(); // overall open-latency clock
   const spec = await contracts.get(symbol);
   const longRest = getRest(group.longAccount);
   const shortRest = getRest(group.shortAccount);
@@ -98,11 +99,26 @@ async function openHedge(group, { getRest, contracts, feed }) {
       ? rest.submitLimitOpen({ symbol, side, vol, leverage: group.leverage, openType: group.openType, positionMode, price: limitPrice })
       : rest.submitMarketOpen({ symbol, side, vol, leverage: group.leverage, openType: group.openType, positionMode });
 
+  // time each leg's submit round-trip individually so we can see per-account latency
+  const timedOpen = async (rest, side, limitPrice, label, acct) => {
+    const t = Date.now();
+    try {
+      const r = await openLeg(rest, side, limitPrice);
+      logger.info(`[hedge ${group.name}] ${label} order acked on ${acct} in ${Date.now() - t}ms`);
+      return r;
+    } catch (e) {
+      logger.warn(`[hedge ${group.name}] ${label} order on ${acct} errored after ${Date.now() - t}ms: ${e.message}`);
+      throw e;
+    }
+  };
+
   // fire both legs in parallel
+  const tSubmit = Date.now();
   const [longRes, shortRes] = await Promise.allSettled([
-    openLeg(longRest, SIDE.OPEN_LONG, longPrice),
-    openLeg(shortRest, SIDE.OPEN_SHORT, shortPrice),
+    timedOpen(longRest, SIDE.OPEN_LONG, longPrice, 'LONG', group.longAccount),
+    timedOpen(shortRest, SIDE.OPEN_SHORT, shortPrice, 'SHORT', group.shortAccount),
   ]);
+  const submitMs = Date.now() - tSubmit;
 
   const longOk = longRes.status === 'fulfilled';
   const shortOk = shortRes.status === 'fulfilled';
@@ -117,10 +133,21 @@ async function openHedge(group, { getRest, contracts, feed }) {
   // resolve real positions (entry price + positionId). Marketable limits fill
   // almost instantly, but allow a little extra time before giving up.
   const resolveOpts = isLimit ? { attempts: 14, delayMs: 700 } : { attempts: 8, delayMs: 700 };
+  // time how long each leg takes to show up as a filled position
+  const timedResolve = async (rest, side, acct) => {
+    const t = Date.now();
+    const pos = await resolveLegPosition(rest, symbol, side, resolveOpts);
+    logger.info(
+      `[hedge ${group.name}] ${side.toUpperCase()} ${pos ? 'filled' : 'NOT filled'} on ${acct} in ${Date.now() - t}ms`
+    );
+    return pos;
+  };
+  const tFill = Date.now();
   const [longPos, shortPos] = await Promise.all([
-    resolveLegPosition(longRest, symbol, 'long', resolveOpts),
-    resolveLegPosition(shortRest, symbol, 'short', resolveOpts),
+    timedResolve(longRest, 'long', group.longAccount),
+    timedResolve(shortRest, 'short', group.shortAccount),
   ]);
+  const fillMs = Date.now() - tFill;
 
   if (!longPos || !shortPos) {
     logger.error(`[hedge ${group.name}] positions not filled (long=${!!longPos}, short=${!!shortPos}); aborting & cleaning up`);
@@ -158,7 +185,8 @@ async function openHedge(group, { getRest, contracts, feed }) {
   };
 
   logger.info(
-    `[hedge ${group.name}] OPENED run ${run.id}: long entry ${run.long.entry} (pos ${run.long.positionId}), short entry ${run.short.entry} (pos ${run.short.positionId})`
+    `[hedge ${group.name}] OPENED run ${run.id} in ${Date.now() - tOpen0}ms (submit ${submitMs}ms, fill ${fillMs}ms): ` +
+      `long entry ${run.long.entry} (pos ${run.long.positionId}), short entry ${run.short.entry} (pos ${run.short.positionId})`
   );
   return run;
 }
