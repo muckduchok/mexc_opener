@@ -23,8 +23,19 @@ class Manager {
         timeoutMs: config.runtime.httpTimeoutMs,
       }));
     }
-    // contract specs are public; use any account's client
-    const anyRest = this.rest.values().next().value;
+    // contract specs are public (/contract/detail needs no auth); reuse any
+    // static account's client, or fall back to a token-less public client when
+    // accounts come entirely from MongoDB (so config.json can be empty).
+    const anyRest =
+      this.rest.values().next().value ||
+      new MexcRest(
+        { name: 'public', webToken: '' },
+        {
+          privateBase: config.endpoints.privateBase,
+          contractBase: config.endpoints.contractBase,
+          timeoutMs: config.runtime.httpTimeoutMs,
+        }
+      );
     this.contracts = new ContractCache(anyRest);
     this.feed = new PriceFeed({
       wsUrl: config.endpoints.wsUrl,

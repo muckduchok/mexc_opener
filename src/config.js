@@ -65,13 +65,26 @@ function normHedgeMode(v) {
   return s;
 }
 
+// Minimal config skeleton written automatically when no config file exists.
+// Accounts and hedge groups are normally sourced from MongoDB (Listings) at
+// runtime, so an empty file is enough to start in DB-driven mode. All tunables
+// have defaults in .env / code.
+const DEFAULT_CONFIG = { accounts: {}, groups: [] };
+
 function loadConfigFile(configPath) {
   if (!fs.existsSync(configPath)) {
-    fail(
-      `config file not found: ${configPath}. Copy config.example.json -> ${path.basename(
-        configPath
-      )} and fill in your accounts/groups.`
-    );
+    // Auto-create a default config instead of failing: in DB-driven mode the
+    // accounts/groups come from MongoDB, so the file only needs to exist.
+    try {
+      fs.mkdirSync(path.dirname(configPath), { recursive: true });
+      fs.writeFileSync(configPath, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`);
+      logger.info(
+        `[config] ${path.basename(configPath)} not found — created a default one. ` +
+          `Accounts/groups will be pulled from MongoDB (or add them here for static mode).`
+      );
+    } catch (e) {
+      fail(`config file not found and could not be created at ${configPath}: ${e.message}`);
+    }
   }
   let raw;
   try {
@@ -125,7 +138,11 @@ function load() {
   const accounts = {};
   const accObj = raw.accounts || {};
   const accNames = Object.keys(accObj);
-  if (accNames.length === 0) fail('no accounts defined in config');
+  // In DB-driven mode accounts are resolved from MongoDB (Listings), so an empty
+  // accounts block is fine. Only require static accounts when Mongo is disabled.
+  if (accNames.length === 0 && !mongoEnabled) {
+    fail('no accounts defined in config and DATABASE_URL is not set — add an account to config.json or enable the MongoDB (Listings) source');
+  }
   for (const name of accNames) {
     const a = accObj[name] || {};
     if (!a.webToken || String(a.webToken).startsWith('WEB_PASTE')) {
