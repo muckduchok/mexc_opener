@@ -18,6 +18,39 @@ async function resolveLegPosition(rest, symbol, side /* 'long'|'short' */, { att
   return null;
 }
 
+// MEXC web API rate-limit: code 510 "Requests are too frequent". Treat these
+// (and any "too frequent" message) as transient and retryable.
+function isRateLimit(e) {
+  if (!e) return false;
+  if (e.code === 510 || e.code === '510') return true;
+  return /too frequent|frequent.*request|requests are too/i.test(e.message || '');
+}
+
+// Convert a promise into an allSettled-style result without throwing.
+function settle(p) {
+  return p.then(
+    (value) => ({ status: 'fulfilled', value }),
+    (reason) => ({ status: 'rejected', reason })
+  );
+}
+
+/**
+ * Run a submit, retrying on transient MEXC rate-limit errors (code 510) with
+ * linear backoff. Non-rate-limit errors propagate immediately.
+ */
+async function submitWithRetry(fn, { retries = 5, baseDelayMs = 400, label = 'submit', groupName = '' } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (attempt > retries || !isRateLimit(e)) throw e;
+      const delay = baseDelayMs * attempt;
+      logger.warn(`[hedge ${groupName}] ${label} rate-limited (code ${e.code || '?'}); retry ${attempt}/${retries} in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+}
+
 /**
  * Open a hedge: long on group.longAccount, short on group.shortAccount.
  * Returns a `run` object ready for HedgeMonitor, or throws on failure (after
@@ -31,6 +64,11 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
   const shortRest = getRest(group.shortAccount);
   const positionMode = group.positionMode || 1;
   const isLimit = group.orderType === 'limit';
+  // single-account hedge fires BOTH legs on the same account; MEXC rate-limits
+  // /private/order/submit per account, so stagger same-account submits instead
+  // of firing them in parallel (which trips code 510 "Requests are too frequent").
+  const singleAccount = longRest === shortRest;
+  const LEG_GAP_MS = 150;
 
   // ── accumulation timing (secondstoopen) ───────────────────────────────────
   // Begin opening `secondsToOpen` before the target instant; accumulate the
@@ -106,8 +144,9 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
       `(${symbol}, lev ${group.leverage}, openType ${group.openType}, posMode ${positionMode}, ${isLimit ? 'LIMIT' : 'MARKET'})`
   );
 
-  // Submit one chunk of both legs in parallel. Marketable limit prices are
-  // recomputed fresh per chunk so we stay marketable as the book moves.
+  // Submit one chunk of both legs. Marketable limit prices are recomputed fresh
+  // per chunk so we stay marketable as the book moves. Each submit retries on
+  // rate-limit (code 510); same-account legs are staggered to avoid tripping it.
   const submitChunk = async (cv, idx) => {
     let longPrice = null;
     let shortPrice = null;
@@ -116,15 +155,29 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
       longPrice = prices.longPrice;
       shortPrice = prices.shortPrice;
     }
-    const openLeg = (rest, side, limitPrice) =>
-      isLimit
-        ? rest.submitLimitOpen({ symbol, side, vol: cv, leverage: group.leverage, openType: group.openType, positionMode, price: limitPrice })
-        : rest.submitMarketOpen({ symbol, side, vol: cv, leverage: group.leverage, openType: group.openType, positionMode });
+    const openLeg = (rest, side, limitPrice, name) =>
+      submitWithRetry(
+        () =>
+          isLimit
+            ? rest.submitLimitOpen({ symbol, side, vol: cv, leverage: group.leverage, openType: group.openType, positionMode, price: limitPrice })
+            : rest.submitMarketOpen({ symbol, side, vol: cv, leverage: group.leverage, openType: group.openType, positionMode }),
+        { label: `chunk ${idx + 1}/${nChunks} ${name}`, groupName: group.name }
+      );
     const t = Date.now();
-    const [lr, sr] = await Promise.allSettled([
-      openLeg(longRest, SIDE.OPEN_LONG, longPrice),
-      openLeg(shortRest, SIDE.OPEN_SHORT, shortPrice),
-    ]);
+    let lr;
+    let sr;
+    if (singleAccount) {
+      // same account: submit one leg at a time with a small gap
+      lr = await settle(openLeg(longRest, SIDE.OPEN_LONG, longPrice, 'LONG'));
+      await sleep(LEG_GAP_MS);
+      sr = await settle(openLeg(shortRest, SIDE.OPEN_SHORT, shortPrice, 'SHORT'));
+    } else {
+      // separate accounts: fire both in parallel (no shared rate-limit bucket)
+      [lr, sr] = await Promise.allSettled([
+        openLeg(longRest, SIDE.OPEN_LONG, longPrice, 'LONG'),
+        openLeg(shortRest, SIDE.OPEN_SHORT, shortPrice, 'SHORT'),
+      ]);
+    }
     const longOk = lr.status === 'fulfilled';
     const shortOk = sr.status === 'fulfilled';
     if (!longOk) logger.warn(`[hedge ${group.name}] chunk ${idx + 1}/${nChunks} LONG failed: ${lr.reason.message}`);
@@ -155,35 +208,77 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
     }
   }
   const submitMs = Date.now() - tSubmit;
-
-  if (longSubmitted === 0 || shortSubmitted === 0) {
-    logger.error(`[hedge ${group.name}] accumulation produced no orders on a leg (long=${longSubmitted}, short=${shortSubmitted}); aborting & cleaning up`);
-    await abortHedge({ longRest, shortRest, symbol, groupName: group.name, isLimit });
-    throw new Error(`hedge ${group.name}: accumulation failed (long=${longSubmitted}, short=${shortSubmitted})`);
-  }
   if (longSubmitted !== shortSubmitted) {
     logger.warn(
-      `[hedge ${group.name}] LEG IMBALANCE after accumulation: long submitted ${longSubmitted} vs short ${shortSubmitted} contracts (manage the difference manually)`
+      `[hedge ${group.name}] uneven chunk acks (long ${longSubmitted} vs short ${shortSubmitted}); reconciling to ${totalVol}`
     );
   }
 
-  // resolve real positions (entry price + positionId). Marketable limits fill
-  // almost instantly, but allow a little extra time before giving up.
-  const resolveOpts = isLimit ? { attempts: 14, delayMs: 700 } : { attempts: 8, delayMs: 700 };
-  // time how long each leg takes to show up as a filled position
-  const timedResolve = async (rest, side, acct) => {
-    const t = Date.now();
-    const pos = await resolveLegPosition(rest, symbol, side, resolveOpts);
-    logger.info(
-      `[hedge ${group.name}] ${side.toUpperCase()} ${pos ? 'filled' : 'NOT filled'} on ${acct} in ${Date.now() - t}ms`
-    );
-    return pos;
+  // let the last submits' fills land before we measure the shortfall
+  await sleep(800);
+
+  // ── reconcile to target: top up any shortfall (e.g. chunks lost to code 510) ──
+  // Re-resolve actual filled holdVol per leg; if a leg is short by >= one lot,
+  // submit the missing remainder (retried, fresh marketable price) and re-check.
+  const topUp = async (side, name, rest, vol) => {
+    let price = null;
+    if (isLimit) {
+      const prices = await computeLimitPrices(longRest, symbol, spec, contracts, group.limitLevel, group.name);
+      price = side === SIDE.OPEN_LONG ? prices.longPrice : prices.shortPrice;
+    }
+    try {
+      await submitWithRetry(
+        () =>
+          isLimit
+            ? rest.submitLimitOpen({ symbol, side, vol, leverage: group.leverage, openType: group.openType, positionMode, price })
+            : rest.submitMarketOpen({ symbol, side, vol, leverage: group.leverage, openType: group.openType, positionMode }),
+        { label: `${name} top-up ${vol}`, groupName: group.name }
+      );
+      logger.info(`[hedge ${group.name}] ${name} top-up submitted: +${vol} contracts${isLimit ? ` @${price}` : ''}`);
+    } catch (e) {
+      logger.warn(`[hedge ${group.name}] ${name} top-up failed: ${e.message}`);
+    }
   };
+
+  let longPos = null;
+  let shortPos = null;
   const tFill = Date.now();
-  const [longPos, shortPos] = await Promise.all([
-    timedResolve(longRest, 'long', group.longAccount),
-    timedResolve(shortRest, 'short', group.shortAccount),
-  ]);
+  const RECONCILE_ROUNDS = 4;
+  for (let round = 0; round <= RECONCILE_ROUNDS; round++) {
+    const opts =
+      round === 0
+        ? isLimit
+          ? { attempts: 14, delayMs: 700 }
+          : { attempts: 8, delayMs: 700 }
+        : { attempts: 6, delayMs: 600 };
+    [longPos, shortPos] = await Promise.all([
+      resolveLegPosition(longRest, symbol, 'long', opts),
+      resolveLegPosition(shortRest, symbol, 'short', opts),
+    ]);
+    const haveLong = longPos ? safeNum(longPos.holdVol, 0) : 0;
+    const haveShort = shortPos ? safeNum(shortPos.holdVol, 0) : 0;
+    const missLong = Math.floor((totalVol - haveLong) / spec.volUnit) * spec.volUnit;
+    const missShort = Math.floor((totalVol - haveShort) / spec.volUnit) * spec.volUnit;
+    const needLong = missLong >= spec.minVol;
+    const needShort = missShort >= spec.minVol;
+    if (!needLong && !needShort) break;
+    if (round === RECONCILE_ROUNDS) {
+      logger.warn(
+        `[hedge ${group.name}] still short after ${RECONCILE_ROUNDS} top-up round(s): long ${haveLong}/${totalVol}, short ${haveShort}/${totalVol}`
+      );
+      break;
+    }
+    logger.info(
+      `[hedge ${group.name}] top-up round ${round + 1}/${RECONCILE_ROUNDS}: ` +
+        `long ${haveLong}/${totalVol}${needLong ? ` (+${missLong})` : ''}, short ${haveShort}/${totalVol}${needShort ? ` (+${missShort})` : ''}`
+    );
+    if (needLong) await topUp(SIDE.OPEN_LONG, 'LONG', longRest, missLong);
+    if (needShort) {
+      if (singleAccount) await sleep(LEG_GAP_MS);
+      await topUp(SIDE.OPEN_SHORT, 'SHORT', shortRest, missShort);
+    }
+    await sleep(700); // let the top-up fills settle before re-checking
+  }
   const fillMs = Date.now() - tFill;
 
   if (!longPos || !shortPos) {
