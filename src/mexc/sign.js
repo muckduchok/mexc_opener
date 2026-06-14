@@ -18,8 +18,19 @@ function md5(value) {
  * Returns { nonce, sign, body } where `body` is the compact JSON string that
  * the caller must send verbatim as the request payload.
  */
+// Monotonic nonce: the long+short pair is submitted in parallel on the same
+// account, so two calls can land in the SAME millisecond — bump to keep every
+// nonce unique per process (MEXC may reject a reused nonce).
+let lastNonce = 0;
+function nextNonce() {
+  let n = Date.now();
+  if (n <= lastNonce) n = lastNonce + 1;
+  lastNonce = n;
+  return String(n);
+}
+
 function signWeb(token, payloadObj) {
-  const nonce = Date.now().toString();
+  const nonce = nextNonce();
   const body = JSON.stringify(payloadObj == null ? {} : payloadObj);
   const g = md5(token + nonce).slice(7);
   const sign = md5(nonce + body + g);

@@ -217,10 +217,11 @@ class MexcRest {
   }
 
   /**
-   * Close an open position at market.
+   * Close an open position at market. Pass `vol` to close only part of it
+   * (defaults to the full holdVol).
    * @param {object} position open_positions entry
    */
-  async closePositionMarket(position) {
+  async closePositionMarket(position, vol = null) {
     const side =
       position.positionType === POSITION_TYPE.LONG ? SIDE.CLOSE_LONG : SIDE.CLOSE_SHORT;
     const payload = {
@@ -228,7 +229,7 @@ class MexcRest {
       side,
       openType: position.openType,
       type: ORDER_TYPE.MARKET,
-      vol: position.holdVol,
+      vol: vol != null ? vol : position.holdVol,
       leverage: position.leverage,
       price: '0',
       positionId: position.positionId,

@@ -29,9 +29,23 @@ class ContractCache {
       volUnit,
       volScale: safeNum(d.volScale, 0),
       minVol: safeNum(d.minVol, 1) || 1,
+      // maxVol is the cap for a SINGLE ORDER, not for the position. The
+      // position cap comes from the risk-limit tiers (see maxPositionVol).
       maxVol: safeNum(d.maxVol, 0) || Infinity,
       minLeverage: safeNum(d.minLeverage, 1),
       maxLeverage: safeNum(d.maxLeverage, 0) || Infinity,
+      // risk-limit tiers: a position of vol <= tier.maxVol may use leverage up
+      // to tier.maxLeverage (e.g. SILVER_USDT: 3.6M contracts at <=500x).
+      riskTiers: Array.isArray(d.riskLimitCustom)
+        ? d.riskLimitCustom
+            .map((t) => ({
+              level: safeNum(t.level, 0),
+              maxVol: safeNum(t.maxVol, 0),
+              maxLeverage: safeNum(t.maxLeverage, 0),
+            }))
+            .filter((t) => t.maxVol > 0 && t.maxLeverage > 0)
+        : [],
+      riskBaseVol: safeNum(d.riskBaseVol, 0),
       raw: d,
     };
     this.cache.set(symbol, spec);
@@ -39,6 +53,22 @@ class ContractCache {
       `[contract] ${spec.symbol}: size=${spec.contractSize} priceUnit=${spec.priceUnit} priceScale=${spec.priceScale} volUnit=${spec.volUnit} minVol=${spec.minVol} maxLev=${spec.maxLeverage}`
     );
     return spec;
+  }
+
+  /**
+   * Max POSITION size (contracts) allowed at the given leverage, derived from
+   * the symbol's risk-limit tiers (higher tiers allow more volume but cap the
+   * leverage lower). Falls back to riskBaseVol, then Infinity.
+   * NOTE: spec.maxVol is the per-ORDER cap and does NOT limit the position.
+   */
+  maxPositionVol(spec, leverage) {
+    const lev = leverage > 0 ? leverage : 1;
+    let cap = 0;
+    for (const t of spec.riskTiers || []) {
+      if (t.maxLeverage >= lev && t.maxVol > cap) cap = t.maxVol;
+    }
+    if (cap > 0) return cap;
+    return spec.riskBaseVol > 0 ? spec.riskBaseVol : Infinity;
   }
 
   /**
@@ -54,8 +84,11 @@ class ContractCache {
    * position value in USDT), independent of leverage.
    *   contracts = notional / (price * contractSize)
    * Leverage only affects how much collateral the exchange locks
-   * (collateral = notional / leverage). Floored to volUnit, clamped to
-   * [minVol, maxVol]. Returns { vol, notional, marginUsed } or throws < minVol.
+   * (collateral = notional / leverage). Floored to volUnit, clamped to the
+   * POSITION risk-limit for the leverage (NOT to per-order maxVol — chunking
+   * splits large positions into <= maxVol orders). Returns
+   * { vol, notional, marginUsed, requestedVol, clamped, positionCapVol }
+   * or throws when below minVol.
    */
   contractsFromNotional(spec, { notionalUsdt, leverage, price }) {
     if (!(price > 0)) throw new Error('price required to size order');
@@ -68,10 +101,23 @@ class ContractCache {
           `notional=${notionalUsdt.toFixed(2)} perContract=${perContract.toFixed(6)}`
       );
     }
-    if (vol > spec.maxVol) vol = Math.floor(spec.maxVol / spec.volUnit) * spec.volUnit;
+    const requestedVol = vol;
+    const posCap = this.maxPositionVol(spec, leverage);
+    let clamped = false;
+    if (vol > posCap) {
+      vol = Math.floor(posCap / spec.volUnit) * spec.volUnit;
+      clamped = true;
+    }
     const notional = vol * perContract;
     const marginUsed = leverage > 0 ? notional / leverage : null;
-    return { vol, notional, marginUsed };
+    return {
+      vol,
+      notional,
+      marginUsed,
+      requestedVol,
+      clamped,
+      positionCapVol: Number.isFinite(posCap) ? posCap : null,
+    };
   }
 
   /**
@@ -79,8 +125,10 @@ class ContractCache {
    * contracts.
    *   notional   = margin * leverage   (USDT)
    *   contracts  = notional / (price * contractSize)
-   * Floored to volUnit and clamped to [minVol, maxVol].
-   * Returns { vol, notional, marginUsed } or throws if below minVol.
+   * Floored to volUnit and clamped to the POSITION risk-limit for the leverage
+   * (per-order maxVol is handled by chunking, see contractsFromNotional).
+   * Returns { vol, notional, marginUsed, requestedVol, clamped, positionCapVol }
+   * or throws if below minVol.
    */
   contractsFromMargin(spec, { marginUsdt, leverage, price }) {
     if (!(price > 0)) throw new Error('price required to size order');
@@ -93,9 +141,22 @@ class ContractCache {
           `notional=${notional.toFixed(2)} perContract=${perContract.toFixed(6)}`
       );
     }
-    if (vol > spec.maxVol) vol = Math.floor(spec.maxVol / spec.volUnit) * spec.volUnit;
+    const requestedVol = vol;
+    const posCap = this.maxPositionVol(spec, leverage);
+    let clamped = false;
+    if (vol > posCap) {
+      vol = Math.floor(posCap / spec.volUnit) * spec.volUnit;
+      clamped = true;
+    }
     const marginUsed = (vol * perContract) / leverage;
-    return { vol, notional: vol * perContract, marginUsed };
+    return {
+      vol,
+      notional: vol * perContract,
+      marginUsed,
+      requestedVol,
+      clamped,
+      positionCapVol: Number.isFinite(posCap) ? posCap : null,
+    };
   }
 }
 

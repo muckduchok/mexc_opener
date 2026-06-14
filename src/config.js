@@ -163,9 +163,13 @@ function load() {
   const defLimitLevel = envNum('DEFAULT_LIMIT_LEVEL', 3);
   const defPctBasis = normPctBasis(envStr('DEFAULT_PCT_BASIS', 'roe'));
   const defHedgeMode = normHedgeMode(envStr('DEFAULT_HEDGE_MODE', 'dual'));
-  // Gradual accumulation: split each leg's target size into this many chunks,
-  // submitted over the first half of the open window (1 = single shot).
+  // Gradual accumulation: split each leg's target size into this many chunks
+  // (1 = single shot).
   const defOpenChunks = envNum('OPEN_CHUNKS', 5);
+  // Fixed cadence between chunk submits: each tick fires the LONG and SHORT
+  // chunk SIMULTANEOUSLY. 1500ms keeps one account inside MEXC's ~2
+  // order-creates/sec budget even when both legs live on it (single mode).
+  const defChunkIntervalMs = envNum('CHUNK_INTERVAL_MS', 1500);
   // How many seconds BEFORE the target time to begin opening; the position is
   // accumulated over the FIRST HALF of this window. Per-listing override:
   // customFields.secondstoopen.
@@ -247,6 +251,8 @@ function load() {
     const openChunks = g.openChunks != null ? Number(g.openChunks) : defOpenChunks;
     if (!(Number.isInteger(openChunks) && openChunks >= 1))
       fail(`group "${name}": openChunks must be an integer >= 1`);
+    const chunkIntervalMs = g.chunkIntervalMs != null ? Number(g.chunkIntervalMs) : defChunkIntervalMs;
+    if (!(chunkIntervalMs > 0)) fail(`group "${name}": chunkIntervalMs must be > 0`);
     const secondsToOpen = g.secondsToOpen != null ? Number(g.secondsToOpen) : defSecondsToOpen;
     if (!(secondsToOpen >= 0)) fail(`group "${name}": secondsToOpen must be >= 0`);
     const withoutSl = g.withoutSl != null ? !!g.withoutSl : defWithoutSl;
@@ -266,6 +272,7 @@ function load() {
       limitLevel,
       pctBasis,
       openChunks,
+      chunkIntervalMs,
       secondsToOpen,
       withoutSl,
       strategy,
@@ -298,6 +305,7 @@ function load() {
       pctBasis: defPctBasis,
       hedgeMode: defHedgeMode,
       openChunks: defOpenChunks,
+      chunkIntervalMs: defChunkIntervalMs,
       secondsToOpen: defSecondsToOpen,
       withoutSl: defWithoutSl,
     },

@@ -254,6 +254,7 @@ class Manager {
       pctBasis: d.pctBasis,
       // gradual accumulation + timing (per-listing overrides fall back to env defaults)
       openChunks: plan.openChunks != null ? plan.openChunks : d.openChunks,
+      chunkIntervalMs: d.chunkIntervalMs,
       secondsToOpen: plan.secondsToOpen != null ? plan.secondsToOpen : d.secondsToOpen,
       withoutSl: !!plan.withoutSl,
       strategy: { ...this.config.strategyDefaults },

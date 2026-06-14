@@ -26,14 +26,6 @@ function isRateLimit(e) {
   return /too frequent|frequent.*request|requests are too/i.test(e.message || '');
 }
 
-// Convert a promise into an allSettled-style result without throwing.
-function settle(p) {
-  return p.then(
-    (value) => ({ status: 'fulfilled', value }),
-    (reason) => ({ status: 'rejected', reason })
-  );
-}
-
 /**
  * Run a submit, retrying on transient MEXC rate-limit errors (code 510) with
  * linear backoff. Non-rate-limit errors propagate immediately.
@@ -64,11 +56,10 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
   const shortRest = getRest(group.shortAccount);
   const positionMode = group.positionMode || 1;
   const isLimit = group.orderType === 'limit';
-  // single-account hedge fires BOTH legs on the same account; MEXC rate-limits
-  // /private/order/submit per account, so stagger same-account submits instead
-  // of firing them in parallel (which trips code 510 "Requests are too frequent").
+  // BOTH legs of a chunk are always fired together (in parallel) so the hedge
+  // builds symmetrically. One long+short pair per chunk tick stays inside
+  // MEXC's ~2 order-creates/sec per-account budget even on a single account.
   const singleAccount = longRest === shortRest;
-  const LEG_GAP_MS = 150;
 
   // ── accumulation timing (secondstoopen) ───────────────────────────────────
   // Begin opening `secondsToOpen` before the target instant; accumulate the
@@ -110,6 +101,12 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
       price,
     });
     totalVol = sized.vol;
+    if (sized.clamped) {
+      logger.warn(
+        `[hedge ${group.name}] target ${sized.requestedVol} contracts exceeds the MAX POSITION for x${group.leverage} ` +
+          `(risk-limit cap ${sized.positionCapVol}); opening ${totalVol} contracts (lower the leverage to allow a bigger position)`
+      );
+    }
     logger.info(
       `[hedge ${group.name}] sizing: target position ${group.notionalUsdt} USDT (final) x${group.leverage} @${price} -> ${totalVol} contracts ` +
         `(notional ~${sized.notional.toFixed(2)} USDT, est collateral ~${sized.marginUsed != null ? sized.marginUsed.toFixed(2) : '?'} USDT)`
@@ -121,18 +118,50 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
       price,
     });
     totalVol = sized.vol;
+    if (sized.clamped) {
+      logger.warn(
+        `[hedge ${group.name}] target ${sized.requestedVol} contracts exceeds the MAX POSITION for x${group.leverage} ` +
+          `(risk-limit cap ${sized.positionCapVol}); opening ${totalVol} contracts (lower the leverage to allow a bigger position)`
+      );
+    }
     logger.info(
       `[hedge ${group.name}] sizing: margin ${group.marginUsdt} USDT x${group.leverage} @${price} -> ${totalVol} contracts (notional ~${sized.notional.toFixed(2)} USDT)`
     );
   }
 
   // ── split the target size into chunks (don't dump the whole size at once) ──
+  // Fixed cadence: one long+short pair is submitted SIMULTANEOUSLY every
+  // `interval` ms (default 1500). Cap the chunk count so the last submit still
+  // lands inside the accumulation half-window (fills/top-ups use the rest).
+  const interval = group.chunkIntervalMs > 0 ? Math.round(group.chunkIntervalMs) : 1500;
   const wantChunks = Number.isInteger(group.openChunks) && group.openChunks > 0 ? group.openChunks : 1;
   // never make a chunk smaller than minVol
   const maxChunksBySize = Math.max(1, Math.floor(totalVol / spec.minVol));
-  const nChunks = Math.min(wantChunks, maxChunksBySize);
-  const chunkVols = splitVol(totalVol, nChunks, spec.volUnit);
-  const interval = nChunks > 1 ? Math.floor(accumulateMs / nChunks) : 0;
+  const maxChunksByTime = accumulateMs > 0 ? Math.floor(accumulateMs / interval) + 1 : wantChunks;
+  let nChunks = Math.max(1, Math.min(wantChunks, maxChunksBySize, maxChunksByTime));
+  if (nChunks < wantChunks) {
+    logger.warn(
+      `[hedge ${group.name}] capping chunks ${wantChunks} -> ${nChunks} ` +
+        `(minVol ${spec.minVol}, window ${accumulateMs}ms @ ${interval}ms/chunk)`
+    );
+  }
+  // spec.maxVol caps a SINGLE ORDER, not the position: a position bigger than
+  // maxVol MUST be built from more chunks. This overrides the time cap —
+  // finishing a little late beats silently opening a smaller position.
+  const orderCapChunks = Number.isFinite(spec.maxVol) ? Math.ceil(totalVol / spec.maxVol) : 1;
+  if (orderCapChunks > nChunks) {
+    logger.warn(
+      `[hedge ${group.name}] raising chunks ${nChunks} -> ${orderCapChunks} so every order fits the per-order cap (maxVol ${spec.maxVol})`
+    );
+    nChunks = orderCapChunks;
+  }
+  let chunkVols = splitVol(totalVol, nChunks, spec.volUnit);
+  // splitVol puts the remainder into the LAST chunk — re-split if that spills
+  // over the per-order cap (only happens when totalVol is close to n*maxVol)
+  while (Number.isFinite(spec.maxVol) && chunkVols[chunkVols.length - 1] > spec.maxVol) {
+    nChunks += 1;
+    chunkVols = splitVol(totalVol, nChunks, spec.volUnit);
+  }
 
   const layout =
     group.mode === 'single'
@@ -144,9 +173,30 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
       `(${symbol}, lev ${group.leverage}, openType ${group.openType}, posMode ${positionMode}, ${isLimit ? 'LIMIT' : 'MARKET'})`
   );
 
+  // A leg that keeps failing with a NON-rate-limit error (e.g. code 6026 "risk
+  // control verification", auth/balance errors) will never open — stop early
+  // and unwind instead of building one-sided exposure on the healthy leg.
+  const FATAL_LEG_FAILS = 2;
+  const hardFails = { long: 0, short: 0 };
+  const trackLeg = (leg, ok, reason) => {
+    if (ok) hardFails[leg] = 0;
+    else if (!isRateLimit(reason)) hardFails[leg] += 1;
+  };
+  const assertLegsAlive = async () => {
+    const dead =
+      hardFails.long >= FATAL_LEG_FAILS ? 'LONG' : hardFails.short >= FATAL_LEG_FAILS ? 'SHORT' : null;
+    if (!dead) return;
+    logger.error(
+      `[hedge ${group.name}] ${dead} leg failed ${FATAL_LEG_FAILS}x with non-retryable errors — ` +
+        `aborting hedge & unwinding to avoid one-sided exposure`
+    );
+    await abortHedge({ longRest, shortRest, symbol, groupName: group.name, isLimit });
+    throw new Error(`hedge ${group.name}: ${dead} leg cannot open (fatal submit errors)`);
+  };
+
   // Submit one chunk of both legs. Marketable limit prices are recomputed fresh
   // per chunk so we stay marketable as the book moves. Each submit retries on
-  // rate-limit (code 510); same-account legs are staggered to avoid tripping it.
+  // rate-limit (code 510).
   const submitChunk = async (cv, idx) => {
     let longPrice = null;
     let shortPrice = null;
@@ -164,22 +214,15 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
         { label: `chunk ${idx + 1}/${nChunks} ${name}`, groupName: group.name }
       );
     const t = Date.now();
-    let lr;
-    let sr;
-    if (singleAccount) {
-      // same account: submit one leg at a time with a small gap
-      lr = await settle(openLeg(longRest, SIDE.OPEN_LONG, longPrice, 'LONG'));
-      await sleep(LEG_GAP_MS);
-      sr = await settle(openLeg(shortRest, SIDE.OPEN_SHORT, shortPrice, 'SHORT'));
-    } else {
-      // separate accounts: fire both in parallel (no shared rate-limit bucket)
-      [lr, sr] = await Promise.allSettled([
-        openLeg(longRest, SIDE.OPEN_LONG, longPrice, 'LONG'),
-        openLeg(shortRest, SIDE.OPEN_SHORT, shortPrice, 'SHORT'),
-      ]);
-    }
+    // both legs of the pair fire at the same instant, even on one account
+    const [lr, sr] = await Promise.allSettled([
+      openLeg(longRest, SIDE.OPEN_LONG, longPrice, 'LONG'),
+      openLeg(shortRest, SIDE.OPEN_SHORT, shortPrice, 'SHORT'),
+    ]);
     const longOk = lr.status === 'fulfilled';
     const shortOk = sr.status === 'fulfilled';
+    trackLeg('long', longOk, lr.reason);
+    trackLeg('short', shortOk, sr.reason);
     if (!longOk) logger.warn(`[hedge ${group.name}] chunk ${idx + 1}/${nChunks} LONG failed: ${lr.reason.message}`);
     if (!shortOk) logger.warn(`[hedge ${group.name}] chunk ${idx + 1}/${nChunks} SHORT failed: ${sr.reason.message}`);
     logger.info(
@@ -206,6 +249,7 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
     } catch (e) {
       logger.warn(`[hedge ${group.name}] chunk ${i + 1}/${nChunks} errored: ${e.message}`);
     }
+    await assertLegsAlive();
   }
   const submitMs = Date.now() - tSubmit;
   if (longSubmitted !== shortSubmitted) {
@@ -220,7 +264,12 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
   // ── reconcile to target: top up any shortfall (e.g. chunks lost to code 510) ──
   // Re-resolve actual filled holdVol per leg; if a leg is short by >= one lot,
   // submit the missing remainder (retried, fresh marketable price) and re-check.
+  // A single order may not exceed the per-order cap (spec.maxVol); whatever is
+  // still missing is picked up by the next reconcile round.
   const topUp = async (side, name, rest, vol) => {
+    if (Number.isFinite(spec.maxVol) && vol > spec.maxVol) {
+      vol = Math.floor(spec.maxVol / spec.volUnit) * spec.volUnit;
+    }
     let price = null;
     if (isLimit) {
       const prices = await computeLimitPrices(longRest, symbol, spec, contracts, group.limitLevel, group.name);
@@ -234,8 +283,10 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
             : rest.submitMarketOpen({ symbol, side, vol, leverage: group.leverage, openType: group.openType, positionMode }),
         { label: `${name} top-up ${vol}`, groupName: group.name }
       );
+      trackLeg(side === SIDE.OPEN_LONG ? 'long' : 'short', true);
       logger.info(`[hedge ${group.name}] ${name} top-up submitted: +${vol} contracts${isLimit ? ` @${price}` : ''}`);
     } catch (e) {
+      trackLeg(side === SIDE.OPEN_LONG ? 'long' : 'short', false, e);
       logger.warn(`[hedge ${group.name}] ${name} top-up failed: ${e.message}`);
     }
   };
@@ -244,6 +295,20 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
   let shortPos = null;
   const tFill = Date.now();
   const RECONCILE_ROUNDS = 4;
+  const measure = () => {
+    const haveLong = longPos ? safeNum(longPos.holdVol, 0) : 0;
+    const haveShort = shortPos ? safeNum(shortPos.holdVol, 0) : 0;
+    const missLong = Math.floor((totalVol - haveLong) / spec.volUnit) * spec.volUnit;
+    const missShort = Math.floor((totalVol - haveShort) / spec.volUnit) * spec.volUnit;
+    return {
+      haveLong,
+      haveShort,
+      missLong,
+      missShort,
+      needLong: missLong >= spec.minVol,
+      needShort: missShort >= spec.minVol,
+    };
+  };
   for (let round = 0; round <= RECONCILE_ROUNDS; round++) {
     const opts =
       round === 0
@@ -255,28 +320,41 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
       resolveLegPosition(longRest, symbol, 'long', opts),
       resolveLegPosition(shortRest, symbol, 'short', opts),
     ]);
-    const haveLong = longPos ? safeNum(longPos.holdVol, 0) : 0;
-    const haveShort = shortPos ? safeNum(shortPos.holdVol, 0) : 0;
-    const missLong = Math.floor((totalVol - haveLong) / spec.volUnit) * spec.volUnit;
-    const missShort = Math.floor((totalVol - haveShort) / spec.volUnit) * spec.volUnit;
-    const needLong = missLong >= spec.minVol;
-    const needShort = missShort >= spec.minVol;
-    if (!needLong && !needShort) break;
+    let m = measure();
+    if (!m.needLong && !m.needShort) break;
     if (round === RECONCILE_ROUNDS) {
       logger.warn(
-        `[hedge ${group.name}] still short after ${RECONCILE_ROUNDS} top-up round(s): long ${haveLong}/${totalVol}, short ${haveShort}/${totalVol}`
+        `[hedge ${group.name}] still short after ${RECONCILE_ROUNDS} top-up round(s): long ${m.haveLong}/${totalVol}, short ${m.haveShort}/${totalVol}`
       );
       break;
     }
+    // CRITICAL: cancel resting limit orders BEFORE topping up. A resting chunk
+    // that fills AFTER the shortfall was measured would stack on top of the
+    // top-up and overshoot the target (over-accumulation). Cancel, re-measure,
+    // then submit only the true remainder.
+    if (isLimit) {
+      await safeCancelAll(longRest, symbol, group.name);
+      if (!singleAccount) await safeCancelAll(shortRest, symbol, group.name);
+      await sleep(600); // let cancel acks / racing fills settle
+      const [lp, sp] = await Promise.all([
+        resolveLegPosition(longRest, symbol, 'long', { attempts: 1, delayMs: 0 }),
+        resolveLegPosition(shortRest, symbol, 'short', { attempts: 1, delayMs: 0 }),
+      ]);
+      if (lp) longPos = lp;
+      if (sp) shortPos = sp;
+      m = measure();
+      if (!m.needLong && !m.needShort) break;
+    }
     logger.info(
       `[hedge ${group.name}] top-up round ${round + 1}/${RECONCILE_ROUNDS}: ` +
-        `long ${haveLong}/${totalVol}${needLong ? ` (+${missLong})` : ''}, short ${haveShort}/${totalVol}${needShort ? ` (+${missShort})` : ''}`
+        `long ${m.haveLong}/${totalVol}${m.needLong ? ` (+${m.missLong})` : ''}, short ${m.haveShort}/${totalVol}${m.needShort ? ` (+${m.missShort})` : ''}`
     );
-    if (needLong) await topUp(SIDE.OPEN_LONG, 'LONG', longRest, missLong);
-    if (needShort) {
-      if (singleAccount) await sleep(LEG_GAP_MS);
-      await topUp(SIDE.OPEN_SHORT, 'SHORT', shortRest, missShort);
-    }
+    // top up BOTH legs in parallel (same simultaneous-pair rule as the chunks)
+    await Promise.all([
+      m.needLong ? topUp(SIDE.OPEN_LONG, 'LONG', longRest, m.missLong) : Promise.resolve(),
+      m.needShort ? topUp(SIDE.OPEN_SHORT, 'SHORT', shortRest, m.missShort) : Promise.resolve(),
+    ]);
+    await assertLegsAlive();
     await sleep(700); // let the top-up fills settle before re-checking
   }
   const fillMs = Date.now() - tFill;
@@ -286,6 +364,18 @@ async function openHedge(group, { getRest, contracts, feed, targetMs = null }) {
     await abortHedge({ longRest, shortRest, symbol, groupName: group.name, isLimit });
     throw new Error(`hedge ${group.name}: positions not filled after open`);
   }
+
+  // legs must be EQUAL: if one ended bigger (late fills of resting orders, or a
+  // blocked/underfunded counterparty), close the excess so the hedge is neutral.
+  ({ longPos, shortPos } = await rebalanceLegs({
+    longRest,
+    shortRest,
+    symbol,
+    longPos,
+    shortPos,
+    spec,
+    groupName: group.name,
+  }));
 
   const openedAt = Date.now();
   const run = {
@@ -343,6 +433,53 @@ function splitVol(total, n, unit) {
     assigned += v;
   }
   return vols;
+}
+
+/**
+ * Equalise the two legs after reconcile: if one leg ended larger than the
+ * other by at least one lot, close the excess on the LARGER leg at market so
+ * the hedge is delta-neutral before monitoring starts. Best-effort: on failure
+ * the imbalance is logged for manual action.
+ */
+async function rebalanceLegs({ longRest, shortRest, symbol, longPos, shortPos, spec, groupName }) {
+  try {
+    const haveLong = safeNum(longPos.holdVol, 0);
+    const haveShort = safeNum(shortPos.holdVol, 0);
+    const unit = spec.volUnit > 0 ? spec.volUnit : 1;
+    const excess = Math.floor(Math.abs(haveLong - haveShort) / unit) * unit;
+    if (excess < Math.max(spec.minVol, unit)) return { longPos, shortPos };
+    const bigIsLong = haveLong > haveShort;
+    const rest = bigIsLong ? longRest : shortRest;
+    const pos = bigIsLong ? longPos : shortPos;
+    logger.warn(
+      `[hedge ${groupName}] legs unequal (long ${haveLong} vs short ${haveShort}); ` +
+        `closing ${excess} excess on ${bigIsLong ? 'LONG' : 'SHORT'} to rebalance`
+    );
+    // the close order is capped per-order too — slice the excess if needed
+    let remaining = excess;
+    while (remaining > 0) {
+      const slice = Number.isFinite(spec.maxVol)
+        ? Math.min(remaining, Math.floor(spec.maxVol / unit) * unit)
+        : remaining;
+      await submitWithRetry(() => rest.closePositionMarket(pos, slice), {
+        label: `rebalance close ${slice}`,
+        groupName,
+      });
+      remaining -= slice;
+    }
+    await sleep(800); // let the partial close settle before re-reading the leg
+    const fresh = await resolveLegPosition(rest, symbol, bigIsLong ? 'long' : 'short', {
+      attempts: 4,
+      delayMs: 500,
+    });
+    if (fresh) {
+      if (bigIsLong) longPos = fresh;
+      else shortPos = fresh;
+    }
+  } catch (e) {
+    logger.error(`[hedge ${groupName}] rebalance failed: ${e.message} (legs left unequal — check manually)`);
+  }
+  return { longPos, shortPos };
 }
 
 /**
@@ -412,4 +549,4 @@ async function safeClose(rest, position, groupName) {
   }
 }
 
-module.exports = { openHedge, resolveLegPosition, splitVol };
+module.exports = { openHedge, resolveLegPosition, splitVol, rebalanceLegs };

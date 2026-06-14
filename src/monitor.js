@@ -153,6 +153,15 @@ class HedgeMonitor {
       const mode = winner === 'long' ? 'ceil' : 'floor';
       const slPrice = this.contracts.roundPrice(spec, slRaw, mode);
       const rest = this.getRest(leg.account);
+      // refresh the LIVE position size: late fills during accumulation can leave
+      // the run snapshot stale, and MEXC rejects stop orders whose vol does not
+      // match the position (code 2611 "Order quantity error")
+      try {
+        const pos = await rest.getPositionById(leg.positionId);
+        if (pos && Number(pos.holdVol) > 0) leg.vol = Number(pos.holdVol);
+      } catch (e) {
+        logger.warn(`[monitor ${run.id}] could not refresh ${winner} vol: ${e.message}`);
+      }
       logger.info(
         `[monitor ${run.id}] ${winner.toUpperCase()} hit +${run.strategy.profitTriggerPct}% ${run.pctBasis} (pnl@${price}). ` +
           `Placing SL lock @+${run.strategy.stopLockPct}% ${run.pctBasis} -> price ${slPrice} on ${leg.account} pos ${leg.positionId}`
@@ -199,6 +208,13 @@ class HedgeMonitor {
       const mode = loser === 'long' ? 'ceil' : 'floor';
       const slPrice = this.contracts.roundPrice(spec, slRaw, mode);
       const rest = this.getRest(leg.account);
+      // refresh the LIVE position size (see _armFirst: avoids code 2611)
+      try {
+        const pos = await rest.getPositionById(leg.positionId);
+        if (pos && Number(pos.holdVol) > 0) leg.vol = Number(pos.holdVol);
+      } catch (e) {
+        logger.warn(`[monitor ${run.id}] could not refresh ${loser} vol: ${e.message}`);
+      }
       logger.info(
         `[monitor ${run.id}] ${loser.toUpperCase()} reached +${run.strategy.tp2TriggerPct}% ${run.pctBasis} (pnl@${price}). ` +
           `Placing SL lock @+${run.strategy.tp2Pct}% ${run.pctBasis} -> price ${slPrice} on ${leg.account} pos ${leg.positionId}`
